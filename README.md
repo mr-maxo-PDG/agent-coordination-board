@@ -50,7 +50,7 @@ And when they finish:
 coordboard wrap --handle auth-refactor --summary "Session middleware now lives in src/middleware/session.ts; auth.ts re-exports for one release."
 ```
 
-`coordboard sweep` clears stale intents, forgotten locks, and an overgrown bulletin.
+`coordboard sweep` clears stale intents, forgotten locks, and an overgrown events bulletin.
 
 ## How agents learn to use it
 

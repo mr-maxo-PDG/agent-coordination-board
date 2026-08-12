@@ -5,9 +5,10 @@ const commands = require('../src/commands');
 
 const USAGE = `coordboard - coordination board for parallel AI coding agents
 
-  coordboard init [--shared]
+  coordboard init [--shared] [--force]
       Create .coord/ here. Default is local mode: .coord/ is added to .gitignore
       and never leaves this machine. --shared commits it so it syncs via git.
+      Refuses a directory with no .git in it unless --force.
 
   coordboard register --handle <name> --task "<one line>"
                       [--claims "a/*,b.ts"] [--exclusive "gen/*"] [--session-id <id>]

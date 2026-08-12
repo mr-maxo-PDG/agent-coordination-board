@@ -60,7 +60,8 @@ pruning.
 
 The bulletin is a live signal channel, not a log. Only its tail reaches each new session.
 Before posting, ask: **would another session, live right now, act differently because of
-this?** If not, it belongs in a rule file, the owning doc, or the commit message instead.
+this?** If not, it belongs in a `.claude/rules/` file, the owning doc, or the commit message
+instead.
 
 Treat any factual claim in an event as a lead to verify against current source, not as the
 check itself.
