@@ -23,6 +23,15 @@
     "locking"
   ],
   "license": "MIT",
+  "author": "Neb",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mr-maxo-PDG/agent-coordination-board.git"
+  },
+  "homepage": "https://github.com/mr-maxo-PDG/agent-coordination-board#readme",
+  "bugs": {
+    "url": "https://github.com/mr-maxo-PDG/agent-coordination-board/issues"
+  },
   "scripts": {
     "test": "node test/run.js"
   }
