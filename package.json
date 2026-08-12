@@ -1,0 +1,29 @@
+{
+  "name": "agent-coordination-board",
+  "version": "0.1.0",
+  "description": "A coordination board for parallel AI coding agents working in one repo: advisory path claims, a shared bulletin, and optional hard locks.",
+  "bin": {
+    "coordboard": "bin/coordboard.js"
+  },
+  "files": [
+    "bin",
+    "src",
+    "docs",
+    "integrations"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "ai-agents",
+    "coding-agents",
+    "coordination",
+    "claude-code",
+    "parallel",
+    "locking"
+  ],
+  "license": "MIT",
+  "scripts": {
+    "test": "node test/run.js"
+  }
+}
