@@ -46,19 +46,23 @@ const EVENTS_HEADER = '# Coordination events (append-only; newest last)';
 // not stopping at all lets a stray .coord/ in $HOME capture every repo below it.
 function findRoot(start) {
   let dir = path.resolve(start || process.cwd());
+  const home = path.resolve(os.homedir() || '');
   let board = null;
   let outermostRepo = null;
   for (;;) {
-    if (!board && fs.existsSync(path.join(dir, COORD_DIR, 'intents'))) board = dir;
+    if (!board && isRealDir(path.join(dir, COORD_DIR, 'intents'))) board = dir;
     if (fs.existsSync(path.join(dir, '.git'))) outermostRepo = dir;
     const parent = path.dirname(dir);
     if (parent === dir) break;
     dir = parent;
   }
   if (!board) return null;
+  const found = path.resolve(board);
+  // Dotfiles-in-git is common, and it would otherwise make $HOME the outermost repo
+  // and capture every project beneath it. A board at or above home is never a board.
+  if (home && (found === home || home.startsWith(found + path.sep))) return null;
   if (!outermostRepo) return board;
   const bound = path.resolve(outermostRepo);
-  const found = path.resolve(board);
   return found === bound || found.startsWith(bound + path.sep) ? board : null;
 }
 
@@ -73,6 +77,20 @@ function isRegularFile(file) {
   } catch (_) {
     return false;
   }
+}
+
+// A junction or symlink AT .coord/intents redirects every read and write beneath it,
+// so the directories are checked as well as the files inside them.
+function isRealDir(dir) {
+  try {
+    return fs.lstatSync(dir).isDirectory();
+  } catch (_) {
+    return false;
+  }
+}
+
+function boardIsSound(root) {
+  return isRealDir(coordPath(root)) && isRealDir(coordPath(root, 'intents'));
 }
 
 function isValidHandle(handle) {
@@ -91,6 +109,9 @@ function intentPath(root, handle) {
   const file = path.resolve(dir, `${handle}.json`);
   if (!file.startsWith(path.resolve(dir) + path.sep)) {
     throw new Error(`Refusing to write outside ${dir}`);
+  }
+  if (!boardIsSound(root)) {
+    throw new Error(`${dir} is not a real directory. Refusing to work through a link.`);
   }
   return file;
 }
@@ -116,11 +137,10 @@ function loadConfig(root) {
   const cfg = Object.assign({}, DEFAULTS);
   cfg.mode = onDisk.mode === 'shared' ? 'shared' : 'local';
   for (const key of Object.keys(CONFIG_CEILINGS)) {
-    const value = onDisk[key];
-    cfg[key] =
-      typeof value === 'number' && Number.isFinite(value) && value > 0
-        ? Math.min(Math.floor(value), CONFIG_CEILINGS[key])
-        : DEFAULTS[key];
+    // Floor BEFORE the positivity test: 0.5 passes `> 0` and floors to 0, which would
+    // mark every intent stale and switch off every lock in the repo.
+    const n = typeof onDisk[key] === 'number' ? Math.floor(onDisk[key]) : NaN;
+    cfg[key] = Number.isFinite(n) && n > 0 ? Math.min(n, CONFIG_CEILINGS[key]) : DEFAULTS[key];
   }
   return cfg;
 }
@@ -152,14 +172,22 @@ function sanitize(value, max) {
   return flat.length > max ? flat.slice(0, max - 1) + '…' : flat;
 }
 
+const UNSAFE_TEST = new RegExp(UNSAFE_CHARS.source);
+
+// Returns null (meaning "malformed") rather than a repaired list. Testing the raw entry
+// instead of comparing lengths against sanitize() output matters: sanitize also collapses
+// double spaces, so an ordinary path like 'docs/my  file.md' used to fail this and quietly
+// invalidate the whole intent, with the CLI still reporting success.
 function sanitizeClaims(value) {
   if (!Array.isArray(value)) return null;
   if (value.length > LIMITS.claims) return null;
   const out = [];
   for (const entry of value) {
     if (typeof entry !== 'string') return null;
-    const clean = sanitize(entry, LIMITS.claim);
-    if (clean.length !== entry.trim().length) return null;
+    if (entry.length > LIMITS.claim) return null;
+    if (UNSAFE_TEST.test(entry) || /[<>]/.test(entry)) return null;
+    const clean = entry.trim();
+    if (!clean) return null;
     if (!isResourceToken(clean) && globStarCount(clean) > LIMITS.globStars) return null;
     out.push(clean);
   }
@@ -173,6 +201,7 @@ function globStarCount(pattern) {
 
 function readIntents(root) {
   const dir = coordPath(root, 'intents');
+  if (!boardIsSound(root)) return [];
   let names = [];
   try {
     names = fs.readdirSync(dir).filter((n) => n.endsWith('.json'));
@@ -340,13 +369,32 @@ function appendEvent(root, handle, text) {
   fs.appendFileSync(file, (endsWithNewline(file) ? '' : '\n') + line + '\n', 'utf8');
 }
 
+const LOCK_STALE_MS = 2 * 60 * 1000;
+
+function rotationLockAgeMs(root) {
+  try {
+    return Date.now() - fs.statSync(coordPath(root, '.rotate.lock')).mtimeMs;
+  } catch (_) {
+    return null;
+  }
+}
+
 // mkdir is atomic on every platform we target, so the directory IS the lock.
 function withRotationLock(root, fn) {
   const lock = coordPath(root, '.rotate.lock');
   try {
     fs.mkdirSync(lock);
   } catch (_) {
-    return null; // Another process is rotating. Its rotation covers ours.
+    // Nothing cleans up after a crash or a Ctrl-C, so an abandoned lock would disable
+    // rotation forever and the bulletin would grow without bound, silently.
+    const age = rotationLockAgeMs(root);
+    if (age === null || age < LOCK_STALE_MS) return null;
+    try {
+      fs.rmdirSync(lock);
+      fs.mkdirSync(lock);
+    } catch (_) {
+      return null;
+    }
   }
   try {
     return fn();
@@ -390,12 +438,14 @@ function tailEvents(root, count) {
 
 function saveIntent(root, handle, intent) {
   const file = intentPath(root, handle);
-  // intentPath's containment is lexical. A symlink already sitting at that name would
-  // make the write land wherever it points, so refuse rather than follow it.
   if (fs.existsSync(file) && !isRegularFile(file)) {
     throw new Error(`Refusing to write through ${file}: it is not a regular file.`);
   }
-  fs.writeFileSync(file, JSON.stringify(intent, null, 2) + '\n', 'utf8');
+  // Write-then-rename, because lstat cannot see a hardlink and cannot close the window
+  // between the check and the write. rename never follows a link and detaches a hardlink.
+  const tmp = `${file}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(intent, null, 2) + '\n', 'utf8');
+  fs.renameSync(tmp, file);
 }
 
 function deleteIntent(root, handle) {
@@ -433,6 +483,7 @@ module.exports = {
   intentPath,
   isValidHandle,
   sanitize,
+  sanitizeClaims,
   loadConfig,
   nowIso,
   stamp,
@@ -448,6 +499,9 @@ module.exports = {
   overlapsFor,
   appendEvent,
   rotateEvents,
+  rotationLockAgeMs,
+  LOCK_STALE_MS,
+  boardIsSound,
   tailEvents,
   saveIntent,
   deleteIntent,

@@ -39,7 +39,10 @@ Claim rules:
   `src/ui/*` covers that whole subtree. Matching is case-insensitive.
 - A handle is letters, digits, `.`, `-` and `_`, up to 64 characters, because it becomes a
   filename. A claim is at most 256 characters with at most four `*`, because the guard
-  matches it on every write and an unbounded pattern would stall the editor.
+  matches it on every write and an unbounded pattern would stall the editor. Claims cannot
+  contain angle brackets or control characters, which is what keeps a claim from being read
+  as markup once it reaches another agent's context. `register` rejects anything unusable
+  rather than writing an intent the reader would then ignore.
 - `#`-prefixed tokens claim non-file resources: `#port-3000`, `#gpu`, `#db-migrations`. The
   guard does not enforce these, so check other intents for them before taking the resource.
 - Subagents share their parent's session id, so an orchestrator claims the union of what its

@@ -358,5 +358,128 @@ test('an event posted during rotation is not lost', () => {
   );
 });
 
+console.log('security, third pass');
+
+test('a fractional staleHours cannot switch off enforcement', () => {
+  const configFile = path.join(tmp, '.coord', 'config.json');
+  const original = fs.readFileSync(configFile, 'utf8');
+  run(tmp, [
+    'register', '--handle', 'locker3', '--task', 'rewriting', '--exclusive', 'src/parser.ts',
+    '--session-id', 'sess-lock3',
+  ]);
+  for (const hours of [0.5, 0.9, 1e-9, 0.0001]) {
+    fs.writeFileSync(configFile, JSON.stringify({ staleHours: hours }));
+    assert.strictEqual(core.loadConfig(tmp).staleHours, core.DEFAULTS.staleHours, `${hours} floored to 0`);
+    const parsed = JSON.parse(run(tmp, ['guard'], hookInput('sess-other')));
+    assert.strictEqual(parsed.hookSpecificOutput.permissionDecision, 'deny', `lock defeated by ${hours}`);
+  }
+  fs.writeFileSync(configFile, original);
+  run(tmp, ['wrap', '--handle', 'locker3']);
+});
+
+test('a symlinked intents directory is refused, not written through', () => {
+  const elsewhere = path.join(tmp, 'elsewhere');
+  fs.mkdirSync(elsewhere, { recursive: true });
+  const realIntents = path.join(tmp, '.coord', 'intents');
+  const stash = path.join(tmp, '.coord', 'intents-real');
+  fs.renameSync(realIntents, stash);
+  let linked = false;
+  try {
+    fs.symlinkSync(elsewhere, realIntents, 'junction');
+    linked = true;
+  } catch (_) {
+    console.log('       (skipped: junction creation not permitted here)');
+  }
+  try {
+    if (linked) {
+      // Either refusal is correct: the board is not adopted at all, or the write is refused.
+      assert.throws(() =>
+        run(tmp, ['register', '--handle', 'victim', '--task', 'through a linked dir', '--claims', 'x'])
+      );
+      assert.strictEqual(fs.readdirSync(elsewhere).length, 0, 'wrote through the linked directory');
+      assert.deepStrictEqual(core.readIntents(tmp), [], 'read through the linked directory');
+    }
+  } finally {
+    if (linked) fs.unlinkSync(realIntents);
+    fs.renameSync(stash, realIntents);
+    fs.rmSync(elsewhere, { recursive: true, force: true });
+  }
+});
+
+test('a hardlink at a valid handle name is detached, not written through', () => {
+  const victim = path.join(tmp, 'hard-victim.json');
+  fs.writeFileSync(victim, '{"secret":"keepme"}');
+  const hard = path.join(tmp, '.coord', 'intents', 'hard.json');
+  try {
+    fs.linkSync(victim, hard);
+  } catch (_) {
+    console.log('       (skipped: hardlink creation not permitted here)');
+    fs.rmSync(victim, { force: true });
+    return;
+  }
+  run(tmp, ['register', '--handle', 'hard', '--task', 'through a hardlink', '--claims', 'src/h.ts']);
+  assert.strictEqual(fs.readFileSync(victim, 'utf8'), '{"secret":"keepme"}', 'wrote through the hardlink');
+  run(tmp, ['wrap', '--handle', 'hard']);
+  fs.rmSync(victim, { force: true });
+});
+
+test('an ordinary path with double spaces does not silently invalidate an intent', () => {
+  run(tmp, [
+    'register', '--handle', 'spacey', '--task', 'editing a spaced path',
+    '--claims', 'docs/my  file.md', '--session-id', 'sess-space',
+  ]);
+  const intent = core.readIntents(tmp).find((i) => i.handle === 'spacey');
+  assert.strictEqual(intent.malformed, false, 'a legitimate claim invalidated its own intent');
+  assert.match(run(tmp, ['check']), /spacey/);
+  run(tmp, ['wrap', '--handle', 'spacey']);
+});
+
+test('an unusable claim is rejected at register time, not silently ignored', () => {
+  assert.throws(
+    () => run(tmp, ['register', '--handle', 'bad', '--task', 'x', '--claims', 'a*b*c*d*e*f*g']),
+    /Unusable --claims/
+  );
+  assert.ok(!fs.existsSync(path.join(intentsDir, 'bad.json')));
+});
+
+test('a board at or above the home directory is never adopted', () => {
+  const home = path.resolve(os.homedir());
+  assert.strictEqual(core.findRoot(home), null, 'a .coord at $HOME would capture every project');
+});
+
+test('a stale rotation lock is broken instead of disabling rotation forever', () => {
+  const cfg = core.loadConfig(tmp);
+  for (let i = 0; i < cfg.rotateWhenLines + 5; i += 1) core.appendEvent(tmp, 'filler', `stale-lock ${i}`);
+  const lock = path.join(tmp, '.coord', '.rotate.lock');
+  fs.mkdirSync(lock, { recursive: true });
+
+  assert.strictEqual(core.rotateEvents(tmp, cfg), 0, 'a held lock should defer rotation');
+  const old = Date.now() - core.LOCK_STALE_MS - 5000;
+  fs.utimesSync(lock, new Date(old), new Date(old));
+  assert.ok(core.rotateEvents(tmp, cfg) > 0, 'a stale lock still blocked rotation');
+  assert.ok(!fs.existsSync(lock), 'lock not released');
+});
+
+test('sweep reports a held rotation lock instead of claiming all is well', () => {
+  const lock = path.join(tmp, '.coord', '.rotate.lock');
+  fs.mkdirSync(lock, { recursive: true });
+  assert.match(run(tmp, ['sweep']), /rotation lock has been held/);
+  fs.rmSync(lock, { recursive: true, force: true });
+});
+
+test('the session-start payload is capped', () => {
+  const eventsFile = path.join(tmp, '.coord', 'events.md');
+  const original = fs.readFileSync(eventsFile, 'utf8');
+  const fat = Array.from({ length: 60 }, (_, i) => `- 2026-01-01T00:00Z [flood@box] ${'x'.repeat(1900)} ${i}`);
+  fs.writeFileSync(eventsFile, original + fat.join('\n') + '\n');
+  fs.writeFileSync(path.join(tmp, '.coord', 'config.json'), JSON.stringify({ startupTailLines: 1e9 }));
+  const out = JSON.parse(run(tmp, ['session-start'], JSON.stringify({ session_id: 'sess-x', cwd: tmp })));
+  assert.ok(
+    out.hookSpecificOutput.additionalContext.length < 10000,
+    `injected ${out.hookSpecificOutput.additionalContext.length} chars`
+  );
+  fs.writeFileSync(eventsFile, original);
+});
+
 console.log(`\n${passed} passed`);
 fs.rmSync(tmp, { recursive: true, force: true });
