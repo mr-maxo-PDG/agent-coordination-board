@@ -289,7 +289,9 @@ function sweep(opts) {
   const archived = core.rotateEvents(root, cfg);
   out.push('', archived ? `Rotated ${archived} events into events-archive.md.` : 'Bulletin under the rotation threshold.');
 
-  const sanctioned = new Set(['README.md', 'events.md', 'events-archive.md', 'config.json', 'intents']);
+  const sanctioned = new Set([
+    'README.md', 'events.md', 'events-archive.md', 'config.json', 'intents', '.rotate.lock',
+  ]);
   let strays = [];
   try {
     strays = fs

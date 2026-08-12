@@ -41,21 +41,38 @@ const HANDLE_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 
 const EVENTS_HEADER = '# Coordination events (append-only; newest last)';
 
-// Walks up for .coord/, but stops at a repo boundary so a stray .coord/ in a
-// parent directory (or $HOME) cannot capture every repo underneath it.
+// Walks up for .coord/, bounded by the OUTERMOST enclosing repo. Stopping at the
+// first .git would lose coordination inside every submodule and vendored checkout;
+// not stopping at all lets a stray .coord/ in $HOME capture every repo below it.
 function findRoot(start) {
   let dir = path.resolve(start || process.cwd());
+  let board = null;
+  let outermostRepo = null;
   for (;;) {
-    if (fs.existsSync(path.join(dir, COORD_DIR, 'intents'))) return dir;
-    if (fs.existsSync(path.join(dir, '.git'))) return null;
+    if (!board && fs.existsSync(path.join(dir, COORD_DIR, 'intents'))) board = dir;
+    if (fs.existsSync(path.join(dir, '.git'))) outermostRepo = dir;
     const parent = path.dirname(dir);
-    if (parent === dir) return null;
+    if (parent === dir) break;
     dir = parent;
   }
+  if (!board) return null;
+  if (!outermostRepo) return board;
+  const bound = path.resolve(outermostRepo);
+  const found = path.resolve(board);
+  return found === bound || found.startsWith(bound + path.sep) ? board : null;
 }
 
 function coordPath(root, ...rest) {
   return path.join(root, COORD_DIR, ...rest);
+}
+
+// lstat, not stat: the question is whether this entry IS a link, not what it points at.
+function isRegularFile(file) {
+  try {
+    return fs.lstatSync(file).isFile();
+  } catch (_) {
+    return false;
+  }
 }
 
 function isValidHandle(handle) {
@@ -78,6 +95,16 @@ function intentPath(root, handle) {
   return file;
 }
 
+const CONFIG_CEILINGS = {
+  staleHours: 24 * 30,
+  startupTailLines: 100,
+  rotateWhenLines: 10000,
+  rotateKeepLines: 10000,
+};
+
+// Every value is clamped against its default. config.json is as untrusted as the
+// intents beside it, and `{"staleHours": 0}` would otherwise mark every intent stale
+// and silently switch off every lock in the repo, with no notice anywhere.
 function loadConfig(root) {
   let onDisk = {};
   try {
@@ -86,7 +113,16 @@ function loadConfig(root) {
   } catch (_) {
     // A missing or unreadable config is not an error: defaults are the contract.
   }
-  return Object.assign({}, DEFAULTS, onDisk);
+  const cfg = Object.assign({}, DEFAULTS);
+  cfg.mode = onDisk.mode === 'shared' ? 'shared' : 'local';
+  for (const key of Object.keys(CONFIG_CEILINGS)) {
+    const value = onDisk[key];
+    cfg[key] =
+      typeof value === 'number' && Number.isFinite(value) && value > 0
+        ? Math.min(Math.floor(value), CONFIG_CEILINGS[key])
+        : DEFAULTS[key];
+  }
+  return cfg;
 }
 
 function nowIso() {
@@ -101,11 +137,18 @@ function machine() {
   return sanitize(process.env.COORD_MACHINE || os.hostname(), LIMITS.machine);
 }
 
-// Anything that will be interpolated into an agent's context. Newlines and control
-// characters are how injected text escapes its line and impersonates the harness.
+// Anything that will be interpolated into an agent's context. Control characters and
+// the unicode line and bidi separators escape the line; angle brackets would let a task
+// string close the fence marking this text untrusted and continue as trusted prose.
+const UNSAFE_CHARS = /[\u0000-\u001F\u007F\u200B\u2028\u2029\u202A-\u202E\u2066-\u2069]+/g;
+
 function sanitize(value, max) {
   if (typeof value !== 'string') return '';
-  const flat = value.replace(/[\u0000-\u001F\u007F]+/g, ' ').trim();
+  const flat = value
+    .replace(UNSAFE_CHARS, ' ')
+    .replace(/[<>]/g, '')
+    .replace(/ {2,}/g, ' ')
+    .trim();
   return flat.length > max ? flat.slice(0, max - 1) + '…' : flat;
 }
 
@@ -142,6 +185,9 @@ function readIntents(root) {
     const bad = (error) => ({ handle: sanitize(handle, LIMITS.handle), file, data: null, malformed: true, error });
 
     if (!isValidHandle(handle)) return bad('filename is not a valid handle');
+    // Never read through a link: containment here is lexical, so a symlink planted in
+    // intents/ would otherwise make any file on disk look like a live intent.
+    if (!isRegularFile(file)) return bad('not a regular file (symlink or directory)');
 
     let raw;
     try {
@@ -294,23 +340,47 @@ function appendEvent(root, handle, text) {
   fs.appendFileSync(file, (endsWithNewline(file) ? '' : '\n') + line + '\n', 'utf8');
 }
 
+// mkdir is atomic on every platform we target, so the directory IS the lock.
+function withRotationLock(root, fn) {
+  const lock = coordPath(root, '.rotate.lock');
+  try {
+    fs.mkdirSync(lock);
+  } catch (_) {
+    return null; // Another process is rotating. Its rotation covers ours.
+  }
+  try {
+    return fn();
+  } finally {
+    try {
+      fs.rmdirSync(lock);
+    } catch (_) {}
+  }
+}
+
 // Keeps the bulletin small: its tail is injected into every session's startup.
 function rotateEvents(root, cfg) {
-  const { header, events } = splitEvents(readEventsFile(root));
-  if (events.length <= cfg.rotateWhenLines) return 0;
-  const keep = events.slice(-cfg.rotateKeepLines);
-  const archived = events.slice(0, events.length - cfg.rotateKeepLines);
-  const archivePath = coordPath(root, 'events-archive.md');
-  let existing = '';
-  try {
-    existing = fs.readFileSync(archivePath, 'utf8').replace(/\s+$/, '') + '\n';
-  } catch (_) {
-    existing = '# Archived coordination events (rotated out of events.md)\n\n';
-  }
-  // Archive first: a crash between the two leaves a duplicate, never a hole.
-  fs.writeFileSync(archivePath, existing + archived.join('\n') + '\n', 'utf8');
-  writeEventsFileAtomic(root, header, keep);
-  return archived.length;
+  return (
+    withRotationLock(root, () => {
+      const { events } = splitEvents(readEventsFile(root));
+      if (events.length <= cfg.rotateWhenLines) return 0;
+      const archived = events.slice(0, events.length - cfg.rotateKeepLines);
+      const archivePath = coordPath(root, 'events-archive.md');
+      let existing = '';
+      try {
+        existing = fs.readFileSync(archivePath, 'utf8').replace(/\s+$/, '') + '\n';
+      } catch (_) {
+        existing = '# Archived coordination events (rotated out of events.md)\n\n';
+      }
+      // Archive first: a crash between the two leaves a duplicate, never a hole.
+      fs.writeFileSync(archivePath, existing + archived.join('\n') + '\n', 'utf8');
+
+      // Re-read immediately before the swap. Appends land at the end, so dropping the
+      // archived count off the front keeps anything posted while we were archiving.
+      const now = splitEvents(readEventsFile(root));
+      writeEventsFileAtomic(root, now.header, now.events.slice(archived.length));
+      return archived.length;
+    }) || 0
+  );
 }
 
 function tailEvents(root, count) {
@@ -319,7 +389,13 @@ function tailEvents(root, count) {
 }
 
 function saveIntent(root, handle, intent) {
-  fs.writeFileSync(intentPath(root, handle), JSON.stringify(intent, null, 2) + '\n', 'utf8');
+  const file = intentPath(root, handle);
+  // intentPath's containment is lexical. A symlink already sitting at that name would
+  // make the write land wherever it points, so refuse rather than follow it.
+  if (fs.existsSync(file) && !isRegularFile(file)) {
+    throw new Error(`Refusing to write through ${file}: it is not a regular file.`);
+  }
+  fs.writeFileSync(file, JSON.stringify(intent, null, 2) + '\n', 'utf8');
 }
 
 function deleteIntent(root, handle) {
