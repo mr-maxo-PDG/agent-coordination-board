@@ -34,7 +34,11 @@ coordboard register --handle auth-refactor \
 Claim rules:
 
 - Claim what you will actually edit. Narrow claims are the point: a claim so broad that it
-  overlaps everyone signals nothing. Claiming the repo root is refused.
+  overlaps everyone signals nothing. `register` refuses a wildcard anchored at the repo root
+  and one anchored at a source tree (a directory with 16 or more directories under it, so
+  `src/**` is fine in a small repo and refused in a monorepo). If the scope is not known at
+  registration time (an issue list, a triage pass), claim the narrow set you start from and
+  re-run `register` with the same handle once triage names the files.
 - Paths are repo-relative with forward slashes. `*` matches anything **including** `/`, so
   `src/ui/*` covers that whole subtree. Matching is case-insensitive.
 - A handle is letters, digits, `.`, `-` and `_`, up to 64 characters, because it becomes a

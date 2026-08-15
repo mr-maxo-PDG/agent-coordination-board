@@ -75,6 +75,43 @@ test('register refuses a repo-root claim', () => {
   );
 });
 
+test('register refuses a wildcard rooted at a source tree, and allows a work area', () => {
+  const big = fs.mkdtempSync(path.join(os.tmpdir(), 'coordboard-broad-'));
+  fs.mkdirSync(path.join(big, '.git'), { recursive: true });
+  // A source root: many subsystems under one directory, like Assets/Scripts or a monorepo src/.
+  for (let i = 0; i < 20; i += 1) fs.mkdirSync(path.join(big, 'app', 'scripts', 'sub' + i), { recursive: true });
+  // A work area inside it: this is what a claim is supposed to look like.
+  for (let i = 0; i < 3; i += 1) fs.mkdirSync(path.join(big, 'app', 'scripts', 'sub0', 'leaf' + i), { recursive: true });
+  run(big, ['init']);
+
+  assert.throws(
+    () => run(big, ['register', '--handle', 'tree', '--task', 'issue list', '--claims', 'app/scripts/**']),
+    /whole source tree/
+  );
+  // The same over-broad claim in --exclusive would hard-deny every other session.
+  assert.throws(
+    () => run(big, ['register', '--handle', 'tree', '--task', 'issue list', '--exclusive', 'app/scripts/*']),
+    /whole source tree/
+  );
+  assert.throws(
+    () => run(big, ['register', '--handle', 'tree', '--task', 'everything', '--claims', 'app/**']),
+    /whole source tree/
+  );
+
+  run(big, ['register', '--handle', 'narrow', '--task', 'one subsystem', '--claims', 'app/scripts/sub0/**']);
+  // A claim on paths that do not exist yet is a plan, not a tree grab.
+  run(big, ['register', '--handle', 'new-files', '--task', 'new subsystem', '--claims', 'app/scripts/future/*']);
+  // No wildcard means the claim names its own files, however deep the directory is.
+  run(big, ['register', '--handle', 'exact', '--task', 'one file', '--claims', 'app/scripts/notes.md']);
+  fs.rmSync(big, { recursive: true, force: true });
+});
+
+test('claimTooBroad ignores resource tokens', () => {
+  assert.strictEqual(core.claimTooBroad(tmp, '#unity-editor'), null);
+  assert.strictEqual(core.claimPrefixDir('src/ui/Hex*'), 'src/ui');
+  assert.strictEqual(core.claimPrefixDir('**'), '');
+});
+
 test('check --path reports the advisory claim', () => {
   const out = run(tmp, ['check', '--path', path.join(tmp, 'src', 'parser.ts'), '--session-id', 'sess-b']);
   assert.match(out, /advisory claim by demo-a/);

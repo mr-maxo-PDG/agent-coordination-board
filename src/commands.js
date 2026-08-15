@@ -97,9 +97,6 @@ function register(opts) {
   if (!opts.task) throw new Error('register needs --task "one line describing what this session is doing"');
 
   const claims = list(opts.claims);
-  if (claims.some((c) => core.normalizeClaim(c) === '*')) {
-    throw new Error('Refusing to claim the repo root (*). Claim the paths you will actually edit.');
-  }
   // Validate on the way in. An intent whose claims fail the reader's rules is treated as
   // malformed and ignored, so writing one and reporting success is a silent fail-open.
   for (const [field, value] of [['claims', claims], ['exclusive', list(opts.exclusive)]]) {
@@ -110,6 +107,19 @@ function register(opts) {
           `angle brackets or control characters.`
       );
     }
+  }
+  // A claim only coordinates if it is narrower than "somewhere in this repo". The root
+  // was always refused; a wildcard one directory down ('Assets/Scripts/**', 'src/*') is
+  // the same claim wearing a prefix, and it used to sail straight through.
+  for (const claim of [...claims, ...list(opts.exclusive)]) {
+    const reason = core.claimTooBroad(root, claim);
+    if (!reason) continue;
+    throw new Error(
+      `Refusing '${claim}': ${reason}. It overlaps every other session and so signals nothing. ` +
+        'Claim the subtrees or files you will actually edit. If the scope is not known yet ' +
+        '(an issue list, a triage pass), claim the narrow set you are starting from and re-run ' +
+        'register with the same handle once triage names the files.'
+    );
   }
 
   const now = core.nowIso();

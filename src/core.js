@@ -35,6 +35,14 @@ const LIMITS = {
   // Each '*' becomes an unbounded '.*'. Adjacent ones backtrack exponentially, and
   // the guard runs this on every write, so a hostile claim could hang the editor.
   globStars: 4,
+  // A wildcard claim rooted at a source tree matches nearly every edit any session
+  // makes: it notifies everyone about everything, which tells no one anything, and it
+  // leaves the sessions around it negotiating by hand on the bulletin instead. Measured
+  // against the tree rather than a list of directory names, because the same path means
+  // different things in different repos: a src/ holding three folders is a work area, a
+  // src/ holding twenty is the whole codebase. Counted through the whole subtree, not
+  // just the immediate children, or a single wrapper directory hides the tree below it.
+  claimTreeDirs: 16,
 };
 
 const HANDLE_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
@@ -276,6 +284,57 @@ function normalizeClaim(claim) {
   return String(claim).replace(/\\/g, '/').replace(/^\/+/, '');
 }
 
+// Everything in a claim before its first wildcard, cut back to the last '/'. Returns
+// null for a claim with no wildcard (it names its own files, so it is never over-broad)
+// and '' for one anchored at the repo root.
+function claimPrefixDir(claim) {
+  const normalized = normalizeClaim(claim);
+  if (isResourceToken(normalized)) return null;
+  const star = normalized.indexOf('*');
+  if (star < 0) return null;
+  const head = normalized.slice(0, star);
+  const cut = head.lastIndexOf('/');
+  return cut < 0 ? '' : head.slice(0, cut);
+}
+
+// Directories anywhere under a repo-relative directory, counting no further than
+// `limit` because the only question is whether it is past the threshold. -1 when the
+// directory does not exist: claiming paths you are about to create is not the same as
+// claiming a tree.
+function countTreeDirs(root, rel, limit) {
+  const start = rel ? path.join(root, rel) : root;
+  if (!isRealDir(start)) return -1;
+  const cap = typeof limit === 'number' ? limit : LIMITS.claimTreeDirs;
+  let count = 0;
+  const queue = [start];
+  while (queue.length && count < cap) {
+    const dir = queue.pop();
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch (_) {
+      continue;
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      if (entry.name === '.git' || entry.name === 'node_modules') continue;
+      count += 1;
+      queue.push(path.join(dir, entry.name));
+    }
+  }
+  return count;
+}
+
+// Why a claim is too broad to be a signal, or null when it is fine.
+function claimTooBroad(root, claim) {
+  const prefix = claimPrefixDir(claim);
+  if (prefix === null) return null;
+  if (prefix === '') return 'it is anchored at the repo root';
+  const dirs = countTreeDirs(root, prefix, LIMITS.claimTreeDirs);
+  if (dirs < LIMITS.claimTreeDirs) return null;
+  return `${prefix}/ holds ${dirs}+ directories, so this claims a whole source tree`;
+}
+
 function isResourceToken(claim) {
   return normalizeClaim(claim).startsWith('#');
 }
@@ -494,6 +553,9 @@ module.exports = {
   claimMatches,
   isResourceToken,
   normalizeClaim,
+  claimPrefixDir,
+  countTreeDirs,
+  claimTooBroad,
   globStarCount,
   relFromRoot,
   overlapsFor,
