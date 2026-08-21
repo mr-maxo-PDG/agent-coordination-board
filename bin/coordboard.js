@@ -12,12 +12,27 @@ const USAGE = `coordboard - coordination board for parallel AI coding agents
 
   coordboard register --handle <name> --task "<one line>"
                       [--claims "a/*,b.ts"] [--exclusive "gen/*"] [--session-id <id>]
+                      [--validates <handle>] [--force]
       Declare what this session is doing and which paths it will touch, before
       the first edit. Run again with the same handle to update the claims.
+      Refuses to register when one live session already claims every path you
+      named: that is the same work twice, so it prints the --validates command
+      to check their work instead. --force registers anyway when the overlap is
+      real files but different work.
+
+      --validates <handle> registers this session as the checker of a live
+      session's work. It posts an event so they know, and their claims stop
+      reading as a conflict for you.
 
   coordboard check [--path <file>] [--json]
       Who else is live, what they claim, and the recent events. With --path,
       also reports the claims on that one file.
+
+  coordboard who [--path <file>]
+      Which live sessions are in this repo, and the address to message each one at.
+      With --path, who claims that one file and how to reach them. Addresses are
+      resolved live, so a session that has exited reports as unreachable rather than
+      handing you a name that swallows messages.
 
   coordboard event "<one line>" [--handle <name>]
       Post a live signal other sessions should act on.
@@ -91,6 +106,8 @@ function main() {
         return console.log(commands.wrap(opts));
       case 'sweep':
         return console.log(commands.sweep(opts));
+      case 'who':
+        return console.log(commands.who(opts));
       case 'guard':
         return process.stdout.write(commands.guard());
       case 'session-start':

@@ -3,6 +3,7 @@
 const fs = require('fs');
 const path = require('path');
 const core = require('./core');
+const peers = require('./peers');
 
 function requireRoot(opts) {
   const root = core.findRoot(opts.cwd || process.cwd());
@@ -23,14 +24,88 @@ function list(value) {
     .filter(Boolean);
 }
 
-function describeIntent(intent) {
+// `peerList` is optional and callers that have already read the registry pass it, so a
+// report over many intents does not re-scan the sessions directory per line. Without it
+// the description is exactly what it was before peer discovery existed.
+function describeIntent(intent, peerList) {
   if (intent.malformed) return `${intent.handle}: MALFORMED (${intent.error})`;
   const d = intent.data;
   const age = core.ageHours(intent);
   const claims = (d.claims || []).join(', ') || 'none';
   const locks = (d.exclusive || []).join(', ');
   const lockNote = locks ? ` | EXCLUSIVE: ${locks}` : '';
-  return `${intent.handle} [${d.machine || '?'}]: ${d.task || '(no task)'} | claims: ${claims}${lockNote} | updated ${age.toFixed(1)}h ago`;
+  // Leads with the role, because a validator's claims mean something different: it is
+  // reading those paths to check them, not queuing a second edit into them.
+  const role = d.validates ? `VALIDATING '${d.validates}' | ` : '';
+  return `${intent.handle} [${d.machine || '?'}]: ${role}${d.task || '(no task)'} | claims: ${claims}${lockNote} | updated ${age.toFixed(1)}h ago${addressNote(d, peerList)}`;
+}
+
+// The messaging address for whoever holds an intent, resolved fresh on every read: a
+// session's name is derived and changes, so a name stored at register time would be a
+// stale address by the time another session tried to use it.
+function addressNote(data, peerList) {
+  if (!Array.isArray(peerList)) return '';
+  const peer = peers.addressFor(data && data.session_id, peerList);
+  if (peer) return ` | message: ${peer.name} (${peer.status})`;
+  if (!data || !data.session_id) return ' | no session_id, not addressable';
+  return ' | session gone, not addressable';
+}
+
+// Cross-references the intents against the sessions actually running in this repo. The
+// interesting cell is the third one: a live session with no intent is invisible to the
+// board today, and it is the common case, because nothing forces registration.
+function peerReport(root, intents) {
+  if (!peers.available()) return null;
+  const live = peers.forRoot(root);
+  const byId = new Map();
+  intents.forEach((i) => {
+    if (!i.malformed && i.data.session_id) byId.set(i.data.session_id, i);
+  });
+  const own = peers.self();
+  const rows = live.map((peer) => ({
+    peer,
+    intent: byId.get(peer.sessionId) || null,
+    isSelf: !!(own && own.pid === peer.pid),
+  }));
+  const liveIds = new Set(live.map((p) => p.sessionId));
+  const orphaned = intents.filter(
+    (i) => !i.malformed && i.data.session_id && !liveIds.has(i.data.session_id)
+  );
+  return { rows, orphaned, unregistered: rows.filter((r) => !r.intent).length };
+}
+
+function renderPeerReport(report) {
+  if (!report) return [];
+  const out = [];
+  const n = report.rows.length;
+  out.push('', `Sessions live in this repo: ${n} (${n - report.unregistered} registered)`);
+  if (!n) out.push('  none');
+  report.rows.forEach((r) => {
+    const you = r.isSelf ? ' (you)' : '';
+    const held = r.intent
+      ? `registered as '${r.intent.handle}'`
+      : 'NOT REGISTERED - no declared claims, so the guard cannot warn anyone about its edits';
+    out.push(`  - ${r.peer.name} [${r.peer.status}]${you}: ${held}`);
+  });
+  if (report.unregistered) {
+    out.push(
+      '  A session with no intent is not misbehaving, it may be read-only. If it is editing,',
+      '  message it by name and ask it to register.'
+    );
+  }
+  if (report.orphaned.length) {
+    out.push(
+      '',
+      'Registered but the session is gone (these are dead, regardless of age):'
+    );
+    report.orphaned.forEach((i) => out.push(`  - ${i.handle}`));
+    out.push('  `coordboard sweep` clears them.');
+  }
+  return out;
+}
+
+function liveIntent(root, cfg, handle) {
+  return core.readIntents(root).find((i) => !i.malformed && i.handle === handle && core.isFresh(i, cfg)) || null;
 }
 
 // ---------------------------------------------------------------- init
@@ -122,6 +197,60 @@ function register(opts) {
     );
   }
 
+  const cfg = core.loadConfig(root);
+  const ownSession = core.sessionId(opts.sessionId);
+
+  // A validator is registered against a live handle, so a typo or a session that has
+  // already wrapped is caught here rather than producing an intent that reviews nothing.
+  let validates = '';
+  if (opts.validates && opts.validates !== true) {
+    validates = String(opts.validates).trim();
+    if (validates === opts.handle) throw new Error('A session cannot validate itself.');
+    const target = liveIntent(root, cfg, validates);
+    if (!target) {
+      throw new Error(
+        `No live intent '${validates}' to validate. Run \`coordboard check\` for the current handles; ` +
+          'if that session has wrapped, its work is finished and you should register normally.'
+      );
+    }
+    if (target.data.validates) {
+      throw new Error(
+        `'${validates}' is itself validating '${target.data.validates}'. Validate the session doing the ` +
+          'work, or register normally.'
+      );
+    }
+  }
+
+  // The redirect. Someone live already covers every path this session named, so building
+  // it a second time produces two diffs of the same work and one of them is thrown away.
+  // Checking the other session's work is the higher-value move and it is not blocked by
+  // their edits. --force is the escape hatch for the real case this cannot see: same
+  // files, different region or feature.
+  if (!validates && !opts.force) {
+    const hit = core.redirectTarget(root, cfg, claims, opts.handle, ownSession);
+    if (hit) {
+      const pct = Math.round(hit.overlap.ratio * 100);
+      const lines = [
+        `Not registering '${opts.handle}': session '${hit.intent.handle}' already covers ${pct}% of ` +
+          `these claims (${hit.overlap.covered}/${hit.overlap.total}), so this would be the same work twice.`,
+        '',
+        `  ${describeIntent(hit.intent)}`,
+        '',
+        'Overlapping claims:',
+      ];
+      hit.overlap.pairs.forEach((pr) => lines.push(`  - yours ${pr.mine}  <->  theirs ${pr.theirs}`));
+      lines.push(
+        '',
+        'Validate their work instead of repeating it:',
+        `  coordboard register --handle ${opts.handle} --task "<what you are checking>" --validates ${hit.intent.handle}`,
+        '',
+        'If your change is genuinely different work in the same files (different region, function or',
+        'feature), re-run with --force and post an event saying what separates the two.'
+      );
+      throw new Error(lines.join('\n'));
+    }
+  }
+
   const now = core.nowIso();
   const existingFile = core.intentPath(root, opts.handle);
   let started = now;
@@ -130,40 +259,78 @@ function register(opts) {
   } catch (_) {}
 
   const intent = {
-    session_id: core.sessionId(opts.sessionId),
+    session_id: ownSession,
     handle: opts.handle,
     machine: core.machine(),
     task: String(opts.task).replace(/\r?\n/g, ' ').trim(),
     claims,
     exclusive: list(opts.exclusive),
+    validates,
     started,
     updated: now,
   };
   core.saveIntent(root, opts.handle, intent);
 
   const out = [`Registered intent '${opts.handle}'.`];
+
+  if (validates) {
+    // Posted, not just printed: the session being checked has already started and would
+    // otherwise never learn a reviewer exists until the findings landed.
+    core.appendEvent(root, opts.handle, `validating '${validates}' instead of duplicating it: ${intent.task}`);
+    const target = liveIntent(root, cfg, validates);
+    out.push(
+      '',
+      `Validating '${validates}':`,
+      `  ${describeIntent(target)}`,
+      '',
+      'You are checking their work, not redoing it. Read what they have actually written (working',
+      'diff, their claimed paths, the events they posted), then confirm or refute it against the',
+      'code. Do not rewrite their change to your own taste.',
+      '',
+      'Report with `coordboard event "<verdict + what you checked>" --handle ' + opts.handle + '`,',
+      'and post as soon as you find something rather than saving it all for the wrap: they are',
+      'still building on it. Their claims are not yours, so keep edits to what they ask for or to',
+      'a fix they cannot make themselves; say so in the event when you touch their files.'
+    );
+    return out.join('\n');
+  }
+
   const others = core.readIntents(root).filter((i) => i.handle !== opts.handle);
-  const cfg = core.loadConfig(root);
   const live = others.filter((i) => core.isFresh(i, cfg));
   if (live.length === 0) {
     out.push('No other live sessions.');
-  } else {
-    out.push('', 'Other live sessions:');
-    live.forEach((i) => out.push('  - ' + describeIntent(i)));
-    const collisions = [];
-    for (const i of live) {
-      for (const mine of claims) {
-        const theirs = [...(i.data.claims || []), ...(i.data.exclusive || [])];
-        if (theirs.some((t) => core.normalizeClaim(t) === core.normalizeClaim(mine))) {
-          collisions.push(`${i.handle} also claims ${mine}`);
-        }
-      }
-    }
-    if (collisions.length) {
-      out.push('', 'Overlap with your claims (advisory, not a block):');
-      collisions.forEach((c) => out.push('  - ' + c));
-      out.push('Read their intent and the events tail before editing shared paths.');
-    }
+    return out.join('\n');
+  }
+  out.push('', 'Other live sessions:');
+  live.forEach((i) => out.push('  - ' + describeIntent(i)));
+
+  // Glob-aware, so 'src/ui/*' against 'src/ui/panel.ts' is reported. String equality
+  // used to miss exactly the overlaps worth knowing about.
+  const collisions = [];
+  for (const i of live) {
+    const overlap = core.overlapWithIntent(claims, i.data);
+    overlap.pairs.forEach((pr) =>
+      collisions.push(
+        pr.mine === pr.theirs
+          ? `${i.handle} also claims ${pr.mine}`
+          : `${i.handle} claims ${pr.theirs}, which overlaps your ${pr.mine}`
+      )
+    );
+  }
+  if (collisions.length) {
+    out.push('', 'Overlap with your claims (advisory, not a block):');
+    collisions.forEach((c) => out.push('  - ' + c));
+    out.push(
+      'Read their intent and the events tail before editing shared paths. If one of them turns out',
+      'to be doing your task, drop yours and re-register with --validates <their handle>.'
+    );
+  }
+  if (opts.force) {
+    out.push(
+      '',
+      'Registered with --force past the duplicate-work check. Post an event saying what separates',
+      'your work from theirs.'
+    );
   }
   return out.join('\n');
 }
@@ -193,6 +360,15 @@ function check(opts) {
         live: fresh.map((i) => i.data),
         stale: stale.map((i) => ({ handle: i.handle, malformed: i.malformed })),
         events: core.tailEvents(root, cfg.startupTailLines),
+        sessions: peers.available()
+          ? peers.forRoot(root).map((p) => ({
+              name: p.name,
+              status: p.status,
+              session_id: p.sessionId,
+              registered:
+                fresh.find((i) => !i.malformed && i.data.session_id === p.sessionId)?.handle || null,
+            }))
+          : null,
         path: pathReport && {
           path: pathReport.path,
           exclusive: pathReport.exclusive.map((h) => ({ handle: h.intent.handle, claim: h.claim })),
@@ -204,9 +380,11 @@ function check(opts) {
     );
   }
 
+  const peerList = peers.available() ? peers.readPeers() : null;
   const out = [`Coordination board at ${root} (${cfg.mode} mode)`];
-  out.push('', fresh.length ? 'Live sessions:' : 'Live sessions: none');
-  fresh.forEach((i) => out.push('  - ' + describeIntent(i)));
+  out.push('', fresh.length ? 'Registered intents:' : 'Registered intents: none');
+  fresh.forEach((i) => out.push('  - ' + describeIntent(i, peerList)));
+  renderPeerReport(peerReport(root, intents)).forEach((l) => out.push(l));
   if (stale.length) {
     out.push('', `Stale or malformed (ignored, > ${cfg.staleHours}h or unparseable):`);
     stale.forEach((i) => out.push('  - ' + i.handle));
@@ -218,10 +396,16 @@ function check(opts) {
       out.push('  none');
     }
     pathReport.exclusive.forEach((h) =>
-      out.push(`  - EXCLUSIVE LOCK by ${h.intent.handle} (${h.claim}). Do not edit; coordinate first.`)
+      out.push(
+        `  - EXCLUSIVE LOCK by ${h.intent.handle} (${h.claim}). Do not edit; coordinate first.` +
+          addressNote(h.intent.data, peerList)
+      )
     );
     pathReport.advisory.forEach((h) =>
-      out.push(`  - advisory claim by ${h.intent.handle} (${h.claim}). Not a block; check for real conflict.`)
+      out.push(
+        `  - advisory claim by ${h.intent.handle} (${h.claim}). Not a block; check for real conflict.` +
+          addressNote(h.intent.data, peerList)
+      )
     );
   }
   const tail = core.tailEvents(root, cfg.startupTailLines);
@@ -262,8 +446,19 @@ function wrap(opts) {
     out.push('No --summary given, so nothing was posted. The hook cannot summarize your work; only you can.');
   }
 
-  if (opts.handle && core.deleteIntent(root, opts.handle)) {
-    out.push(`Released intent '${opts.handle}'.`);
+  if (opts.handle) {
+    // Read before deleting: a validator registered against this handle is mid-review of
+    // work that is about to look finished, and its findings still have to land somewhere.
+    const validators = core
+      .readIntents(root)
+      .filter((i) => !i.malformed && core.isFresh(i, cfg) && i.data.validates === opts.handle);
+    if (core.deleteIntent(root, opts.handle)) out.push(`Released intent '${opts.handle}'.`);
+    validators.forEach((v) =>
+      out.push(
+        `'${v.handle}' is validating this work and is still live. Its findings arrive on the bulletin; ` +
+          'do not treat the wrap as the end of verification.'
+      )
+    );
   }
 
   const pruned = pruneStale(root, cfg);
@@ -275,6 +470,27 @@ function wrap(opts) {
   const left = core.readIntents(root);
   out.push(left.length ? `${left.length} intent(s) still registered.` : 'Intents folder is now empty.');
   return out.join('\n');
+}
+
+// Intents held by a session that is no longer running. Only ever called where the peer
+// registry is present: with no registry there is no evidence of death, and an intent
+// that cannot be proven dead is left to the stale clock.
+function pruneDeadSessions(root, cfg) {
+  if (!peers.available()) return [];
+  const liveIds = new Set(peers.forRoot(root).map((p) => p.sessionId));
+  const released = [];
+  for (const intent of core.readIntents(root)) {
+    if (intent.malformed) continue;
+    const id = intent.data.session_id;
+    // No id means it was registered by something outside Claude Code, or by an agent
+    // before the id was captured. Absence of evidence is not death: leave it alone.
+    if (!id || liveIds.has(id)) continue;
+    if (core.deleteIntent(root, intent.handle)) released.push(intent.handle);
+  }
+  if (released.length) {
+    core.appendEvent(root, 'coordboard', `released intents whose session exited: ${released.join(', ')}`);
+  }
+  return released;
 }
 
 function pruneStale(root, cfg) {
@@ -298,6 +514,16 @@ function sweep(opts) {
 
   const pruned = pruneStale(root, cfg);
   out.push(pruned.length ? `Pruned: ${pruned.join(', ')}.` : 'No stale intents.');
+
+  // The clock is a guess; a dead process is a fact. An intent whose session has exited
+  // without running the SessionEnd hook (a crash, a kill) otherwise keeps its claims
+  // and any exclusive lock for the full stale window, blocking live sessions for hours.
+  const dead = pruneDeadSessions(root, cfg);
+  if (dead.length) {
+    out.push(`Released ${dead.length} intent(s) whose session has exited: ${dead.join(', ')}.`);
+  } else if (peers.available()) {
+    out.push('Every registered intent has a live session behind it.');
+  }
 
   const locks = core
     .readIntents(root)
@@ -335,6 +561,84 @@ function sweep(opts) {
   if (strays.length) {
     out.push('', 'Unsanctioned entries in .coord/ (scratch files belong elsewhere, review before deleting):');
     strays.forEach((s) => out.push('  - ' + s));
+  }
+  return out.join('\n');
+}
+
+// ----------------------------------------------------------------- who
+
+// `check` answers "what is the state of the board". `who` answers the one question that
+// only became askable once sessions could message each other: given this file, or this
+// repo, which live session do I talk to, and what is its address?
+function who(opts) {
+  const root = requireRoot(opts);
+  const cfg = core.loadConfig(root);
+  const intents = core.readIntents(root);
+  const fresh = intents.filter((i) => core.isFresh(i, cfg));
+
+  if (!peers.available()) {
+    return [
+      'No peer session registry on this machine, so addresses cannot be resolved.',
+      'Peer discovery is a Claude Code capability; on other agent CLIs use `coordboard check`',
+      'and coordinate through the bulletin.',
+    ].join('\n');
+  }
+  const peerList = peers.readPeers();
+
+  if (opts.path) {
+    const rel = core.relFromRoot(root, opts.path);
+    if (rel === null) throw new Error(`${opts.path} is outside the coordinated repo at ${root}`);
+    const own = core.sessionId(opts.sessionId) || (peers.self() && peers.self().sessionId) || '';
+    const hits = core.overlapsFor(root, cfg, rel, own);
+    const out = [`Who to talk to about ${rel}:`];
+    if (!hits.exclusive.length && !hits.advisory.length) {
+      out.push('  Nobody claims it. Edit it; no message needed.');
+      return out.join('\n');
+    }
+    hits.exclusive.forEach((h) => {
+      const peer = peers.addressFor(h.intent.data.session_id, peerList);
+      out.push(
+        `  EXCLUSIVE LOCK: ${h.intent.handle} - ${h.intent.data.task}`,
+        peer
+          ? `    address: ${peer.name} (${peer.status})`
+          : '    address: unresolved, that session has exited - run `coordboard sweep`'
+      );
+    });
+    hits.advisory.forEach((h) => {
+      const peer = peers.addressFor(h.intent.data.session_id, peerList);
+      out.push(
+        `  advisory claim: ${h.intent.handle} - ${h.intent.data.task}`,
+        peer
+          ? `    address: ${peer.name} (${peer.status})`
+          : '    address: unresolved, that session has exited - run `coordboard sweep`'
+      );
+    });
+    out.push(
+      '',
+      'Advisory means proceed. Message them only if your change genuinely collides with theirs;',
+      'an independent edit in the same file needs a bulletin event, not a message.'
+    );
+    return out.join('\n');
+  }
+
+  const out = [`Sessions live in ${root}:`];
+  const report = peerReport(root, intents);
+  if (!report || !report.rows.length) out.push('  none');
+  (report ? report.rows : []).forEach((r) => {
+    const you = r.isSelf ? ' (you)' : '';
+    out.push(
+      `  ${r.peer.name} [${r.peer.status}]${you}` +
+        (r.intent ? `  '${r.intent.handle}': ${r.intent.data.task}` : '  no intent registered')
+    );
+  });
+  const self = peers.self();
+  if (self) out.push('', `Your own address, as your peers see it: ${self.name}`);
+  if (fresh.some((i) => !i.data.session_id)) {
+    out.push(
+      '',
+      'Some intents carry no session_id and cannot be addressed. They were registered without',
+      'one; re-run `register` from inside the session that owns them.'
+    );
   }
   return out.join('\n');
 }
@@ -418,16 +722,47 @@ function guardInner() {
   }
 
   if (hits.advisory.length) {
-    const who = hits.advisory
-      .map((h) => `session ${h.intent.handle} (@${h.intent.data.machine})\n  claim: ${h.claim}\n  task: ${h.intent.data.task}`)
+    // A validator writing into the session it is checking is expected, not a collision:
+    // the generic 'reconcile the two changes' advice would be wrong for it.
+    const own = input.session_id
+      ? core.readIntents(root).find((i) => !i.malformed && i.data.session_id === input.session_id)
+      : null;
+    const validating = own && own.data.validates;
+    if (validating && hits.advisory.some((h) => h.intent.handle === validating)) {
+      return JSON.stringify({
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse',
+          additionalContext:
+            `coord notice: '${rel}' is claimed by '${validating}', the session you registered to validate. ` +
+            `Editing it is not reconciling a conflict, it is changing work under review: keep it to what they ` +
+            `asked for or to a fix they cannot make, and post an event saying what you changed and why.`,
+        },
+      });
+    }
+    // Resolved here rather than stored, so the notice never prints an address that has
+    // gone stale. Naming it turns 'someone else is in this file' into an action.
+    const peerList = peers.available() ? peers.readPeers() : null;
+    const whoText = hits.advisory
+      .map((h) => {
+        const peer = peerList ? peers.addressFor(h.intent.data.session_id, peerList) : null;
+        const addr = peer ? `\n  address: ${peer.name} (${peer.status})` : '';
+        return `session ${h.intent.handle} (@${h.intent.data.machine})\n  claim: ${h.claim}\n  task: ${h.intent.data.task}${addr}`;
+      })
       .join('\n');
+    const reachable =
+      peerList && hits.advisory.some((h) => peers.addressFor(h.intent.data.session_id, peerList));
     const note =
       `coord notice: '${rel}' is also claimed (advisory, not a lock). ` +
-      fence(who) +
+      fence(whoText) +
       ` This does NOT block you. ` +
       `If your change is independent of theirs (different function, region or feature), proceed and post a one-line ` +
       `event so they are not surprised by the diff. If it genuinely conflicts, reconcile the two changes rather than ` +
-      `clobbering or stopping.`;
+      `clobbering or stopping.` +
+      (reachable
+        ? ` That session is live and addressable: on a genuine conflict message it directly at the address above ` +
+          `rather than waiting on the bulletin. Do NOT message it to announce an independent edit, and never ask a ` +
+          `peer to perform something your own session was denied permission to do.`
+        : '');
     return JSON.stringify({
       hookSpecificOutput: { hookEventName: 'PreToolUse', additionalContext: note },
     });
@@ -449,6 +784,23 @@ function sessionStart() {
   ];
   if (input.session_id) {
     lines.push(`Your session_id: ${core.sanitize(input.session_id, core.LIMITS.handle)}`);
+  }
+
+  // The board can now see sessions that never registered, which is most of them. Stating
+  // the gap at startup is the only moment an agent reliably reads it: the write guard
+  // cannot warn about an unregistered session's edits, having no claims to match.
+  const report = peerReport(root, intents);
+  if (report && report.rows.length > 1) {
+    const others = report.rows.filter((r) => !r.isSelf);
+    const silent = others.filter((r) => !r.intent).length;
+    lines.push(
+      '',
+      `${others.length} other session(s) live in this repo` +
+        (silent ? `, ${silent} with no registered intent.` : '.'),
+      'They are addressable by name. Message one for a genuine conflict or a handoff that cannot wait;',
+      'use the bulletin for anything the next session should still know in an hour. Never ask a peer to',
+      'perform something your own session was denied permission to do.'
+    );
   }
 
   const board = [intents.length ? 'Current intents:' : 'Current intents: none'];
@@ -489,4 +841,4 @@ function sessionEnd() {
   return '';
 }
 
-module.exports = { init, register, check, event, wrap, sweep, guard, sessionStart, sessionEnd };
+module.exports = { init, register, check, event, wrap, sweep, who, guard, sessionStart, sessionEnd };

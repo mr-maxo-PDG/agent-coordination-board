@@ -23,11 +23,12 @@ function test(name, fn) {
   }
 }
 
-function run(cwd, args, stdin) {
+function run(cwd, args, stdin, env) {
   return execFileSync(process.execPath, [BIN, ...args], {
     cwd,
     input: stdin === undefined ? '' : stdin,
     encoding: 'utf8',
+    env: env ? Object.assign({}, process.env, env) : process.env,
   });
 }
 
@@ -48,6 +49,29 @@ test('a non-matching sibling does not match', () => {
 });
 test('resource tokens never match a path', () => {
   assert.ok(!core.claimMatches('src/parser.ts', '#db-migrations'));
+});
+
+console.log('claim-against-claim overlap');
+test('a wildcard claim overlaps a file inside it, either way round', () => {
+  assert.ok(core.claimsOverlap('src/ui/*', 'src/ui/panel.ts'));
+  assert.ok(core.claimsOverlap('src/ui/panel.ts', 'src/ui/*'));
+});
+test('a bare directory overlaps the files under it', () => {
+  assert.ok(core.claimsOverlap('src/ui', 'src/ui/panel.ts'));
+});
+test('two different files do not overlap', () => {
+  assert.ok(!core.claimsOverlap('src/a.ts', 'src/b.ts'));
+  assert.ok(!core.claimsOverlap('src/ui/*', 'src/core/db.ts'));
+});
+test('a resource token overlaps only the same token', () => {
+  assert.ok(core.claimsOverlap('#gpu', '#GPU'));
+  assert.ok(!core.claimsOverlap('#gpu', 'src/gpu.ts'));
+});
+test('coverage counts claims, not pairs', () => {
+  const data = { claims: ['src/ui/*'], exclusive: [] };
+  const o = core.overlapWithIntent(['src/ui/a.ts', 'src/ui/b.ts', 'src/core/c.ts'], data);
+  assert.strictEqual(o.covered, 2);
+  assert.strictEqual(o.total, 3);
 });
 
 console.log('cli');
@@ -186,6 +210,110 @@ test('wrap releases the intent and posts the summary', () => {
   run(tmp, ['wrap', '--handle', 'demo-c', '--summary', 'done with x']);
   assert.strictEqual(fs.readdirSync(path.join(tmp, '.coord', 'intents')).length, 0);
   assert.match(fs.readFileSync(path.join(tmp, '.coord', 'events.md'), 'utf8'), /done with x/);
+});
+
+console.log('duplicate work redirects to validation');
+const dup = fs.mkdtempSync(path.join(os.tmpdir(), 'coordboard-dup-'));
+fs.mkdirSync(path.join(dup, '.git'), { recursive: true });
+fs.mkdirSync(path.join(dup, 'src', 'ui'), { recursive: true });
+run(dup, ['init']);
+run(dup, [
+  'register', '--handle', 'builder', '--task', 'raise the clamp',
+  '--claims', 'src/ui/*,src/core.ts', '--session-id', 'sess-build',
+]);
+
+test('register refuses when one session already covers every claim', () => {
+  assert.throws(
+    () =>
+      run(dup, [
+        'register', '--handle', 'twin', '--task', 'raise the clamp',
+        '--claims', 'src/ui/panel.ts,src/core.ts', '--session-id', 'sess-twin',
+      ]),
+    /same work twice[\s\S]*--validates builder/
+  );
+  assert.ok(!fs.existsSync(path.join(dup, '.coord', 'intents', 'twin.json')));
+});
+
+test('partial overlap still registers and is reported glob-aware', () => {
+  const out = run(dup, [
+    'register', '--handle', 'partial', '--task', 'other work',
+    '--claims', 'src/ui/panel.ts,src/other.ts', '--session-id', 'sess-partial',
+  ]);
+  assert.match(out, /overlaps your src\/ui\/panel\.ts/);
+  run(dup, ['wrap', '--handle', 'partial']);
+});
+
+test('--force registers past the redirect', () => {
+  const out = run(dup, [
+    'register', '--handle', 'forced', '--task', 'different region',
+    '--claims', 'src/core.ts', '--session-id', 'sess-forced', '--force',
+  ]);
+  assert.match(out, /--force past the duplicate-work check/);
+  run(dup, ['wrap', '--handle', 'forced']);
+});
+
+test('--validates registers a checker and tells the target', () => {
+  const out = run(dup, [
+    'register', '--handle', 'twin', '--task', 'check the clamp against the grid',
+    '--validates', 'builder', '--session-id', 'sess-twin',
+  ]);
+  assert.match(out, /Validating 'builder'/);
+  const intent = JSON.parse(fs.readFileSync(path.join(dup, '.coord', 'intents', 'twin.json'), 'utf8'));
+  assert.strictEqual(intent.validates, 'builder');
+  assert.match(fs.readFileSync(path.join(dup, '.coord', 'events.md'), 'utf8'), /validating 'builder'/);
+  assert.match(run(dup, ['check']), /VALIDATING 'builder'/);
+});
+
+test('--validates refuses a handle that is not live', () => {
+  assert.throws(
+    () => run(dup, ['register', '--handle', 'ghost', '--task', 'x', '--validates', 'nobody']),
+    /No live intent 'nobody'/
+  );
+});
+
+test('a validator is never itself a redirect target', () => {
+  // 'twin' validates and holds no claims, so the next session is pointed at 'builder'.
+  assert.throws(
+    () =>
+      run(dup, [
+        'register', '--handle', 'third', '--task', 'raise the clamp',
+        '--claims', 'src/core.ts', '--session-id', 'sess-third',
+      ]),
+    /--validates builder/
+  );
+});
+
+test('guard tells a validator it is editing work under review', () => {
+  const parsed = JSON.parse(
+    run(dup, ['guard'], JSON.stringify({
+      session_id: 'sess-twin',
+      cwd: dup,
+      tool_input: { file_path: path.join(dup, 'src', 'core.ts') },
+    }))
+  );
+  assert.match(parsed.hookSpecificOutput.additionalContext, /session you registered to validate/);
+  assert.strictEqual(parsed.hookSpecificOutput.permissionDecision, undefined);
+});
+
+test('wrap warns that a validator is still reviewing', () => {
+  const out = run(dup, ['wrap', '--handle', 'builder', '--summary', 'clamp raised']);
+  assert.match(out, /'twin' is validating this work and is still live/);
+  run(dup, [
+    'register', '--handle', 'builder', '--task', 'raise the clamp',
+    '--claims', 'src/ui/*,src/core.ts', '--session-id', 'sess-build',
+  ]);
+});
+
+test('a stale claim stops triggering the redirect', () => {
+  const file = path.join(dup, '.coord', 'intents', 'builder.json');
+  const intent = JSON.parse(fs.readFileSync(file, 'utf8'));
+  intent.updated = new Date(Date.now() - 9 * 3600 * 1000).toISOString();
+  fs.writeFileSync(file, JSON.stringify(intent, null, 2));
+  run(dup, [
+    'register', '--handle', 'later', '--task', 'same paths, hours later',
+    '--claims', 'src/core.ts', '--session-id', 'sess-later',
+  ]);
+  fs.rmSync(dup, { recursive: true, force: true });
 });
 
 console.log('security');
@@ -517,6 +645,178 @@ test('the session-start payload is capped', () => {
   );
   fs.writeFileSync(eventsFile, original);
 });
+
+
+// ------------------------------------------------- peer session discovery
+//
+// The peer registry is another program's private state, so these tests build a fake one
+// in a temp directory and point the adapter at it with CLAUDE_CONFIG_DIR. That also pins
+// the failure mode that matters: when the registry's shape changes, these go red rather
+// than the board silently reporting every session as absent.
+
+const peers = require('../src/peers');
+
+const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), 'coordboard-home-'));
+const fakeSessions = path.join(fakeHome, 'sessions');
+fs.mkdirSync(fakeSessions, { recursive: true });
+const PEER_ENV = { CLAUDE_CONFIG_DIR: fakeHome };
+
+function writeSession(pid, extra) {
+  const rec = Object.assign(
+    {
+      pid,
+      sessionId: 'sess-' + pid,
+      cwd: tmp,
+      name: 'peer-' + pid,
+      peerProtocol: 1,
+      status: 'idle',
+      kind: 'interactive',
+      updatedAt: Date.now(),
+    },
+    extra || {}
+  );
+  fs.writeFileSync(path.join(fakeSessions, pid + '.json'), JSON.stringify(rec), 'utf8');
+  return rec;
+}
+
+function withPeerEnv(fn) {
+  const prev = process.env.CLAUDE_CONFIG_DIR;
+  process.env.CLAUDE_CONFIG_DIR = fakeHome;
+  try {
+    return fn();
+  } finally {
+    if (prev === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+    else process.env.CLAUDE_CONFIG_DIR = prev;
+  }
+}
+
+console.log('peer session discovery');
+
+test('a live session in this repo resolves to a messaging address', () => {
+  writeSession(process.pid);
+  const found = withPeerEnv(() => peers.forRoot(tmp));
+  assert.strictEqual(found.length, 1);
+  assert.strictEqual(found[0].name, 'peer-' + process.pid);
+});
+
+test('a record whose process is gone is not a peer', () => {
+  // A crash or a kill leaves the file behind; advertising it would hand out an address
+  // that silently swallows every message sent to it.
+  writeSession(999999, { sessionId: 'sess-dead', name: 'peer-dead' });
+  const names = withPeerEnv(() => peers.forRoot(tmp)).map((p) => p.name);
+  assert.ok(!names.includes('peer-dead'), 'dead session surfaced: ' + names.join(', '));
+  fs.unlinkSync(path.join(fakeSessions, '999999.json'));
+});
+
+test('a record caught mid-rewrite is skipped, not read as a nameless peer', () => {
+  const torn = path.join(fakeSessions, '4242.json');
+  fs.writeFileSync(torn, '{"pid":4242,"sessionId":"sess-4242","cwd"', 'utf8');
+  const found = withPeerEnv(() => peers.forRoot(tmp));
+  assert.ok(found.every((p) => p.name && p.sessionId));
+  fs.unlinkSync(torn);
+});
+
+test('a record missing its name is not treated as addressable', () => {
+  writeSession(4243, { name: undefined });
+  const found = withPeerEnv(() => peers.forRoot(tmp));
+  assert.ok(!found.some((p) => p.sessionId === 'sess-4243'));
+  fs.unlinkSync(path.join(fakeSessions, '4243.json'));
+});
+
+test('an unknown peer protocol is skipped rather than guessed at', () => {
+  writeSession(4244, { peerProtocol: 99, name: 'peer-future' });
+  const found = withPeerEnv(() => peers.forRoot(tmp));
+  assert.ok(!found.some((p) => p.name === 'peer-future'));
+  fs.unlinkSync(path.join(fakeSessions, '4244.json'));
+});
+
+test('a session in another repo is filtered out', () => {
+  // Message addressing is machine-wide but coordination is per-repo: without this the
+  // board points an agent at a session working on an unrelated project.
+  writeSession(4245, { cwd: path.join(os.tmpdir(), 'some-other-project'), name: 'peer-elsewhere' });
+  const found = withPeerEnv(() => peers.forRoot(tmp));
+  assert.ok(!found.some((p) => p.name === 'peer-elsewhere'));
+  fs.unlinkSync(path.join(fakeSessions, '4245.json'));
+});
+
+test('a name that is not a plain token is refused as an address', () => {
+  // A name reaches an LLM's context and is used as a send target.
+  writeSession(4246, { name: 'peer <script> evil', sessionId: 'sess-4246' });
+  const found = withPeerEnv(() => peers.forRoot(tmp));
+  assert.ok(!found.some((p) => p.sessionId === 'sess-4246'));
+  fs.unlinkSync(path.join(fakeSessions, '4246.json'));
+});
+
+console.log('addresses on the board');
+
+test('check reports live sessions that never registered', () => {
+  const out = run(tmp, ['check'], '', PEER_ENV);
+  assert.match(out, /Sessions live in this repo/);
+  assert.match(out, /NOT REGISTERED/);
+});
+
+test('who resolves the claim holder on a path to an address', () => {
+  run(tmp, ['register', '--handle', 'addr-holder', '--task', 'holding parser',
+    '--claims', 'src/parser.ts', '--session-id', 'sess-' + process.pid]);
+  const out = run(tmp, ['who', '--path', 'src/parser.ts'], '', PEER_ENV);
+  assert.match(out, /addr-holder/);
+  assert.match(out, new RegExp('address: peer-' + process.pid));
+});
+
+test('an intent whose session has exited reports as unreachable, not as a stale address', () => {
+  run(tmp, ['register', '--handle', 'addr-ghost', '--task', 'ghost work',
+    '--claims', 'src/ghost.ts', '--session-id', 'sess-not-running']);
+  const out = run(tmp, ['who', '--path', 'src/ghost.ts'], '', PEER_ENV);
+  assert.match(out, /that session has exited/);
+});
+
+test('sweep releases an intent whose session is gone, without waiting for the stale clock', () => {
+  const out = run(tmp, ['sweep'], '', PEER_ENV);
+  assert.match(out, /addr-ghost/);
+  assert.ok(!fs.existsSync(path.join(tmp, '.coord', 'intents', 'addr-ghost.json')));
+});
+
+test('sweep leaves an intent with no session_id alone', () => {
+  // No id is not evidence of death: it may have been registered by another agent CLI.
+  // Deleting it would silently drop a live session's claims and its exclusive locks.
+  run(tmp, ['register', '--handle', 'addr-idless', '--task', 'no id', '--claims', 'src/idless.ts'],
+    '', { COORD_SESSION_ID: '', CLAUDE_CODE_SESSION_ID: '', CLAUDE_SESSION_ID: '' });
+  run(tmp, ['sweep'], '', PEER_ENV);
+  assert.ok(fs.existsSync(path.join(tmp, '.coord', 'intents', 'addr-idless.json')));
+  run(tmp, ['wrap', '--handle', 'addr-idless']);
+});
+
+test('the guard names an address on an advisory overlap', () => {
+  const out = run(tmp, ['guard'], JSON.stringify({
+    session_id: 'someone-else',
+    tool_input: { file_path: path.join(tmp, 'src', 'parser.ts') },
+  }), PEER_ENV);
+  const ctx = JSON.parse(out).hookSpecificOutput.additionalContext;
+  assert.match(ctx, new RegExp('address: peer-' + process.pid));
+  assert.match(ctx, /never ask a peer to perform something your own session was denied/i);
+});
+
+test('session-start states how many live sessions never registered', () => {
+  writeSession(process.ppid || 1, { sessionId: 'sess-other', name: 'peer-other' });
+  const out = JSON.parse(
+    run(tmp, ['session-start'], JSON.stringify({ session_id: 'x', cwd: tmp }), PEER_ENV)
+  );
+  assert.match(out.hookSpecificOutput.additionalContext, /other session\(s\) live in this repo/);
+});
+
+test('with no peer registry the board behaves exactly as before', () => {
+  const out = run(tmp, ['check'], '', { CLAUDE_CONFIG_DIR: path.join(fakeHome, 'absent') });
+  assert.ok(!/Sessions live in this repo/.test(out), 'peer section leaked with no registry');
+  assert.match(out, /Registered intents/);
+});
+
+test('who says so plainly when peer discovery is unavailable', () => {
+  const out = run(tmp, ['who'], '', { CLAUDE_CONFIG_DIR: path.join(fakeHome, 'absent') });
+  assert.match(out, /No peer session registry/);
+});
+
+run(tmp, ['wrap', '--handle', 'addr-holder']);
+fs.rmSync(fakeHome, { recursive: true, force: true });
 
 console.log(`\n${passed} passed`);
 fs.rmSync(tmp, { recursive: true, force: true });
