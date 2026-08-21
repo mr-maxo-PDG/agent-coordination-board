@@ -24,6 +24,9 @@ const DEFAULTS = {
   startupTailLines: 8,
   rotateWhenLines: 60,
   rotateKeepLines: 30,
+  // Percent of a new intent's claims that one live session must already cover before
+  // register redirects it to validating that session instead of duplicating the work.
+  redirectCoveragePct: 100,
 };
 
 const LIMITS = {
@@ -129,6 +132,7 @@ const CONFIG_CEILINGS = {
   startupTailLines: 100,
   rotateWhenLines: 10000,
   rotateKeepLines: 10000,
+  redirectCoveragePct: 100,
 };
 
 // Every value is clamped against its default. config.json is as untrusted as the
@@ -253,6 +257,11 @@ function readIntents(root) {
         task: sanitize(raw.task, LIMITS.task),
         claims,
         exclusive,
+        // The handle this session is checking rather than editing. Sanitized as a handle
+        // and dropped unless it is well-formed, so it can never name a path.
+        validates: isValidHandle(sanitize(raw.validates, LIMITS.handle))
+          ? sanitize(raw.validates, LIMITS.handle)
+          : '',
         started: sanitize(raw.started, 40),
         updated: sanitize(raw.updated, 40),
       },
@@ -353,6 +362,62 @@ function relFromRoot(root, target) {
   const rel = path.relative(root, abs);
   if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) return null;
   return rel.replace(/\\/g, '/');
+}
+
+// Do two CLAIMS cover any of the same ground? This is claim-against-claim, where
+// claimMatches is claim-against-one-path. Two literals overlap only when they are the
+// same path or one is a directory containing the other. Where either side wildcards,
+// the other's raw text is tested against it: an approximation that deliberately errs
+// toward reporting an overlap, because the cost of a false positive is one sentence of
+// advice and the cost of a false negative is two sessions writing the same code.
+function claimsOverlap(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  const A = normalizeClaim(a);
+  const B = normalizeClaim(b);
+  if (!A || !B) return false;
+  if (A.length > LIMITS.claim || B.length > LIMITS.claim) return false;
+  if (globStarCount(A) > LIMITS.globStars || globStarCount(B) > LIMITS.globStars) return false;
+  // A resource token names a thing, not a tree, so only the same token collides with it.
+  if (isResourceToken(A) || isResourceToken(B)) return A.toLowerCase() === B.toLowerCase();
+  const la = A.toLowerCase();
+  const lb = B.toLowerCase();
+  if (la.startsWith(lb + '/') || lb.startsWith(la + '/')) return true;
+  return globToRegex(A).test(B) || globToRegex(B).test(A);
+}
+
+// How much of `myClaims` one other intent already covers. `pairs` is what to show the
+// agent: which of its claims collides with which of theirs.
+function overlapWithIntent(myClaims, data) {
+  const mine = Array.isArray(myClaims) ? myClaims : [];
+  const theirs = [...((data && data.claims) || []), ...((data && data.exclusive) || [])];
+  const pairs = [];
+  let covered = 0;
+  for (const claim of mine) {
+    const hit = theirs.find((t) => claimsOverlap(claim, t));
+    if (!hit) continue;
+    covered += 1;
+    pairs.push({ mine: claim, theirs: hit });
+  }
+  return { pairs, covered, total: mine.length, ratio: mine.length ? covered / mine.length : 0 };
+}
+
+// The one live session that already covers enough of these claims that starting the same
+// work again would duplicate it, or null. A validator is never the answer: redirecting a
+// third session onto it would stack reviewers on a review.
+function redirectTarget(root, cfg, myClaims, ownHandle, ownSessionId) {
+  if (!myClaims || !myClaims.length) return null;
+  const threshold = cfg.redirectCoveragePct / 100;
+  let best = null;
+  for (const intent of readIntents(root)) {
+    if (!isFresh(intent, cfg)) continue;
+    if (intent.handle === ownHandle) continue;
+    if (ownSessionId && intent.data.session_id && intent.data.session_id === ownSessionId) continue;
+    if (intent.data.validates) continue;
+    const overlap = overlapWithIntent(myClaims, intent.data);
+    if (overlap.ratio < threshold) continue;
+    if (!best || overlap.covered > best.overlap.covered) best = { intent, overlap };
+  }
+  return best;
 }
 
 // Returns every fresh intent from another session that claims this path.
@@ -522,10 +587,19 @@ function deleteIntent(root, handle) {
   }
 }
 
+// The id that ties an intent to a live editor session. It is what the peer registry is
+// keyed on, so getting it wrong does not fail loudly: the intent still writes, and only
+// the liveness and address lookups quietly return nothing.
+//
+// CLAUDE_SESSION_ID never existed. The variable Claude Code actually exports is
+// CLAUDE_CODE_SESSION_ID, so every intent registered by an agent that did not pass
+// --session-id explicitly was stored with an empty id. The wrong name is kept last as a
+// fallback in case another tool adopted it.
 function sessionId(explicit) {
   return sanitize(
     (typeof explicit === 'string' && explicit) ||
       process.env.COORD_SESSION_ID ||
+      process.env.CLAUDE_CODE_SESSION_ID ||
       process.env.CLAUDE_SESSION_ID ||
       '',
     LIMITS.handle
@@ -551,6 +625,9 @@ module.exports = {
   ageHours,
   isFresh,
   claimMatches,
+  claimsOverlap,
+  overlapWithIntent,
+  redirectTarget,
   isResourceToken,
   normalizeClaim,
   claimPrefixDir,
