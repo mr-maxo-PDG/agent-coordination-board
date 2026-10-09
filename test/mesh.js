@@ -239,6 +239,21 @@ function post(port, route, body) {
     await E.stop();
   });
 
+  await test('a peer that stalls mid-body does not hang the request', async () => {
+    const http = require('http');
+    const srv = http.createServer((req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json', 'content-length': 100 });
+      res.write('{"partial":');
+    });
+    await new Promise((r) => srv.listen(BASE + 900, '127.0.0.1', r));
+    const t0 = Date.now();
+    const out = await mesh.request(addr(BASE + 900), 'GET', '/hello', undefined, '', 200);
+    srv.closeAllConnections();
+    srv.close();
+    assert.strictEqual(out, null);
+    assert.ok(Date.now() - t0 < 1500, `took ${Date.now() - t0}ms`);
+  });
+
   for (const d of [A, B, D]) if (d) await d.stop();
   console.log(`\n${passed} mesh test(s) passed`);
   process.exit(process.exitCode || 0);

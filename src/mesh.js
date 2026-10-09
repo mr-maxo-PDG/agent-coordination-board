@@ -224,7 +224,18 @@ function cleanIntent(i, node, user) {
 // --- http plumbing -----------------------------------------------------------------
 
 function request(addr, method, route, body, token, timeoutMs) {
-  return new Promise((resolve) => {
+  return new Promise((done) => {
+    // A socket that dies after the headers reports on `res`, not `req`; without a
+    // settle-once guard and a hard deadline the beat loop awaits it forever.
+    let settled = false;
+    const resolve = (v) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(deadline);
+      done(v);
+    };
+    const wait = timeoutMs || PROBE_TIMEOUT_MS;
+    const deadline = setTimeout(() => (req.destroy(), resolve(null)), wait * 2);
     const [host, port] = addr.split(':');
     const data = body === undefined ? null : Buffer.from(JSON.stringify(body));
     const req = http.request(
@@ -233,7 +244,7 @@ function request(addr, method, route, body, token, timeoutMs) {
         port: Number(port) || DEFAULT_PORT,
         method,
         path: route,
-        timeout: timeoutMs || PROBE_TIMEOUT_MS,
+        timeout: wait,
         headers: Object.assign(
           { 'content-type': 'application/json' },
           data ? { 'content-length': data.length } : {},
@@ -248,6 +259,8 @@ function request(addr, method, route, body, token, timeoutMs) {
           if (size > BODY_LIMIT) req.destroy();
           else chunks.push(c);
         });
+        res.on('error', () => resolve(null));
+        res.on('close', () => resolve(null));
         res.on('end', () => {
           try {
             resolve(res.statusCode === 200 ? JSON.parse(Buffer.concat(chunks).toString('utf8')) : null);
@@ -259,6 +272,7 @@ function request(addr, method, route, body, token, timeoutMs) {
     );
     req.on('timeout', () => req.destroy());
     req.on('error', () => resolve(null));
+    req.on('close', () => resolve(null));
     if (data) req.write(data);
     req.end();
   });
@@ -773,6 +787,7 @@ function readSnapshot() {
 
 module.exports = {
   PROTO,
+  request,
   DEFAULT_PORT,
   BEAT_MS,
   meshHome,
