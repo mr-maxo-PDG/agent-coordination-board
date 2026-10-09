@@ -893,10 +893,13 @@ async function meshCommand(opts) {
     return new Promise(() => {});
   }
   if (sub === 'up') {
-    if (!(await mesh.ensureDaemon())) {
-      for (let i = 0; i < 20 && !(await mesh.local('/local/view')); i += 1) {
-        await new Promise((r) => setTimeout(r, 250));
-      }
+    await mesh.ensureDaemon();
+    // The daemon answers before its first election finishes; wait for a view, or a
+    // fresh one reports itself as a hubless follower.
+    for (let i = 0; i < 24; i += 1) {
+      const res = await mesh.local('/local/view');
+      if (res && res.view) break;
+      await new Promise((r) => setTimeout(r, 250));
     }
     return meshStatus(await meshView());
   }
