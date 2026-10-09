@@ -5,6 +5,7 @@
 // loopback, never to the hub directly, so a slow or partitioned tailnet costs a hook at
 // most one short local timeout. Every path fails to printing nothing.
 
+const crypto = require('crypto');
 const peers = require('./peers');
 const core = require('./core');
 const mesh = require('./mesh');
@@ -50,6 +51,12 @@ function editPatch(tool, input) {
   if (tool === 'Write') return `(whole file written)\n${String(input.content || '').slice(0, 1500)}`;
   if (tool === 'NotebookEdit') return `(notebook cell ${input.cell_id || '?'} ${input.edit_mode || 'replace'})\n${input.new_source || ''}`;
   return '';
+}
+
+// Which working tree an edit landed in. Two sessions share a tree only when they share a
+// machine AND a checkout, which is exactly when an edit is already on the other's disk.
+function treeId(top) {
+  return crypto.createHash('sha1').update(`${core.machine()}|${top.toLowerCase()}`).digest('hex').slice(0, 16);
 }
 
 function targetOf(input) {
@@ -131,12 +138,32 @@ async function onPostTool(input) {
       repoKey: info.key,
       path: rel,
       tool,
+      tree: treeId(info.top),
       patch: mesh.cleanPatch(editPatch(tool, input.tool_input || {})),
     });
   } else if (rel && tool === 'Read') {
     await mesh.local('/local/read', { sessionId: input.session_id, repoKey: info.key, path: rel });
   }
-  return drainInbox(input.session_id);
+  return (await peerChanges(input)).concat(await drainInbox(input.session_id));
+}
+
+async function peerChanges(input) {
+  const info = mesh.repoInfo(input.cwd || process.cwd());
+  if (!info) return [];
+  const res = await mesh.local('/local/peer-changes', { sessionId: input.session_id, tree: treeId(info.top) });
+  const list = (res && res.changes) || [];
+  if (!list.length) return [];
+  const lines = ['A teammate changed files you are working on. Include their changes in your work:'];
+  for (const t of list) {
+    lines.push(`- ${t.path}, ${hhmm(t.at)}, ${who(t)} via ${t.tool}${t.sameTree ? ' (same checkout: already on disk, re-read it)' : ''}:`);
+    lines.push(...String(t.patch).split('\n').map((l) => `    ${l}`));
+  }
+  if (list.some((t) => !t.sameTree)) {
+    lines.push(
+      'Changes from another checkout are NOT in your copy. Apply each one with Edit, using the - text as old_string and the + text as new_string exactly as given. If the - text is no longer there, or the change conflicts with what you are doing, do not force it: message its author (coordboard mesh send --to <session name> "<text>") and agree who changes what. A whole-file Write cannot be applied from this excerpt; ask its author to commit and push it.'
+    );
+  }
+  return lines;
 }
 
 async function run() {
@@ -146,7 +173,7 @@ async function run() {
   if (event === 'SessionStart') lines = await onSessionStart(input);
   else if (event === 'PreToolUse' && EDIT_TOOLS.has(input.tool_name)) lines = await onPreEdit(input);
   else if (event === 'PostToolUse') lines = await onPostTool(input);
-  else if (event === 'UserPromptSubmit') lines = await drainInbox(input.session_id);
+  else if (event === 'UserPromptSubmit') lines = (await peerChanges(input)).concat(await drainInbox(input.session_id));
   return output(event, lines);
 }
 

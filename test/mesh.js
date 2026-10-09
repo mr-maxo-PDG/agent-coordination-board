@@ -144,6 +144,44 @@ function post(port, route, body) {
     assert.strictEqual(after.body.touches.length, 0, 're-reading the file clears the warning');
   });
 
+  await test('a peer edit from another checkout is pushed once to a session working on that file', async () => {
+    const repo = 'github.com/x/y';
+    await post(pB, '/local/read', { sessionId: 'sess-b-0003', repoKey: repo, path: 'src/lexer.ts' });
+    await new Promise((r) => setTimeout(r, 5));
+    await post(pA, '/touch', {
+      repoKey: repo, path: 'src/lexer.ts', sessionId: 'sess-c-0001', node: 'node-c', user: 'nate',
+      tool: 'Edit', tree: 'tree-c', patch: '- a\n+ b',
+    });
+    await B.tick();
+    const r = await post(pB, '/local/peer-changes', { sessionId: 'sess-b-0003', tree: 'tree-b' });
+    assert.strictEqual(r.body.changes.length, 1);
+    assert.strictEqual(r.body.changes[0].sameTree, false);
+    const again = await post(pB, '/local/peer-changes', { sessionId: 'sess-b-0003', tree: 'tree-b' });
+    assert.strictEqual(again.body.changes.length, 0, 'a pushed change must not be pushed twice');
+  });
+
+  await test('applying a teammate patch does not bounce it back to its author', async () => {
+    const repo = 'github.com/x/y';
+    // sess-b-0003 folds nate's patch in; nate's own daemon is B here, standing in for node-c.
+    await post(pB, '/local/touch', { sessionId: 'sess-b-0004', repoKey: repo, path: 'src/ast.ts', tool: 'Edit', tree: 'tree-c', patch: '- p\n+ q' });
+    await new Promise((r) => setTimeout(r, 5));
+    await post(pA, '/touch', { repoKey: repo, path: 'src/ast.ts', sessionId: 'sess-x', node: 'node-x', user: 'max', tool: 'Edit', tree: 'tree-x', patch: '- p\n+ q' });
+    await B.tick();
+    const r = await post(pB, '/local/peer-changes', { sessionId: 'sess-b-0004', tree: 'tree-c' });
+    assert.strictEqual(r.body.changes.length, 0);
+  });
+
+  await test('a same-checkout edit is skipped once the session has re-read the file', async () => {
+    const repo = 'github.com/x/y';
+    await post(pB, '/local/read', { sessionId: 'sess-b-0005', repoKey: repo, path: 'src/emit.ts' });
+    await new Promise((r) => setTimeout(r, 5));
+    await post(pA, '/touch', { repoKey: repo, path: 'src/emit.ts', sessionId: 'sess-b-0006', node: 'node-b', user: 'max', tool: 'Edit', tree: 'tree-b', patch: '- m\n+ n' });
+    await B.tick();
+    await post(pB, '/local/read', { sessionId: 'sess-b-0005', repoKey: repo, path: 'src/emit.ts' });
+    const r = await post(pB, '/local/peer-changes', { sessionId: 'sess-b-0005', tree: 'tree-b' });
+    assert.strictEqual(r.body.changes.length, 0);
+  });
+
   await test('local endpoints are not served to hub routes, and hub routes refuse a follower', async () => {
     const r = await post(pB, '/beat', { id: 'x' });
     assert.strictEqual(r.code, 409);

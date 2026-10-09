@@ -305,6 +305,8 @@ function createDaemon(cfgOverride) {
     mailbox: new Map(),
     outbox: [],
     reads: new Map(),
+    notified: new Map(),
+    sent: new Map(),
     eventOffsets: new Map(),
   };
   const servers = [];
@@ -390,6 +392,7 @@ function createDaemon(cfgOverride) {
       node: cleanId(t.node),
       user: cleanText(t.user, 64),
       tool: cleanText(t.tool, 24),
+      tree: cleanId(t.tree),
       patch: cleanPatch(t.patch),
     };
     if (!entry.repoKey || !entry.path || !entry.sessionId) return null;
@@ -581,6 +584,31 @@ function createDaemon(cfgOverride) {
     const m = st.reads.get(sid) || new Map();
     m.set(`${cleanText(b.repoKey, 200)}|${cleanPath(b.path)}`, Date.now());
     st.reads.set(sid, m);
+    // Pushes start from a session's first engagement, so it is not handed the last
+    // hour of everyone's edits the first time it opens a file.
+    if (!st.notified.has(sid)) st.notified.set(sid, Date.now());
+  }
+
+  // Peer edits to files this session has read or edited, not yet pushed to it. An edit
+  // from another checkout (another machine, or another worktree here) is not on this
+  // session's disk, so the session must fold the patch in itself. One from the same
+  // checkout is already on disk, and is skipped once the session has re-read the file.
+  function peerChanges(b) {
+    const sid = cleanId(b.sessionId);
+    const tree = cleanId(b.tree);
+    const engaged = st.reads.get(sid);
+    if (!sid || !engaged || !st.view) return { changes: [] };
+    const since = st.notified.get(sid) || Date.now();
+    const changes = st.view.touches
+      .filter((t) => t.sessionId !== sid && t.at > since && !(st.sent.get(sid) || new Set()).has(t.patch))
+      .filter((t) => {
+        const readAt = engaged.get(`${t.repoKey}|${t.path}`);
+        if (readAt === undefined) return false;
+        return t.tree !== tree || t.at > readAt;
+      })
+      .map((t) => Object.assign({}, t, { sameTree: t.tree === tree }));
+    if (changes.length) st.notified.set(sid, Math.max(...changes.map((t) => t.at)));
+    return { changes };
   }
 
   const LOCAL_OPS = {
@@ -588,6 +616,15 @@ function createDaemon(cfgOverride) {
     '/local/read': (b) => (markRead(b), { ok: true }),
     '/local/touch': (b) => {
       markRead(b);
+      // An agent folding in a teammate's patch re-broadcasts that same patch; remembering
+      // what each session sent keeps it from bouncing back to its author as news.
+      const sid = cleanId(b.sessionId);
+      if (sid) {
+        const set = st.sent.get(sid) || new Set();
+        set.add(cleanPatch(b.patch));
+        if (set.size > 200) set.delete(set.values().next().value);
+        st.sent.set(sid, set);
+      }
       queue('/touch', Object.assign({}, b, { node: me.id, user: me.user }));
       return { ok: true };
     },
@@ -599,6 +636,7 @@ function createDaemon(cfgOverride) {
       return { messages: list };
     },
     '/local/since': sinceFor,
+    '/local/peer-changes': peerChanges,
     '/local/stop': () => (setImmediate(stop), { ok: true }),
   };
 
