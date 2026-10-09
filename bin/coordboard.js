@@ -47,21 +47,36 @@ const USAGE = `coordboard - coordination board for parallel AI coding agents
   coordboard hooks claude-code
       Print the settings.json snippet that wires the enforcing hooks.
 
+  coordboard mesh up | status | down
+      The cross-machine mesh: one daemon per machine, hub elected among them.
+      Configure peers in ~/.coordboard/mesh.json: {"nodes": ["laptop", "bot"],
+      "port": 7717, "priority": 0, "user": "max"}. Highest priority hosts the hub;
+      at equal priority the first machine up keeps it.
+
+  coordboard mesh send --to <session name|handle|session id> "<text>"
+      Message a session on any machine; it arrives on that session's next hook.
+
 Hook adapters (read hook JSON on stdin, not for humans):
-  coordboard guard | coordboard session-start | coordboard session-end
+  coordboard guard | coordboard session-start | coordboard session-end | coordboard mesh-hook
 `;
 
 const HOOK_SNIPPET = {
   hooks: {
     SessionStart: [
       { hooks: [{ type: 'command', command: 'coordboard session-start' }] },
+      { hooks: [{ type: 'command', command: 'coordboard mesh-hook' }] },
     ],
     PreToolUse: [
       {
-        matcher: 'Edit|Write|NotebookEdit',
-        hooks: [{ type: 'command', command: 'coordboard guard' }],
+        matcher: 'Edit|Write|MultiEdit|NotebookEdit',
+        hooks: [
+          { type: 'command', command: 'coordboard guard' },
+          { type: 'command', command: 'coordboard mesh-hook' },
+        ],
       },
     ],
+    PostToolUse: [{ hooks: [{ type: 'command', command: 'coordboard mesh-hook' }] }],
+    UserPromptSubmit: [{ hooks: [{ type: 'command', command: 'coordboard mesh-hook' }] }],
     SessionEnd: [
       { hooks: [{ type: 'command', command: 'coordboard session-end' }] },
     ],
@@ -114,6 +129,20 @@ function main() {
         return process.stdout.write(commands.sessionStart());
       case 'session-end':
         return process.stdout.write(commands.sessionEnd());
+      case 'mesh':
+        return commands
+          .mesh(opts)
+          .then((out) => out && console.log(out))
+          .catch((err) => {
+            console.error(String(err.message || err));
+            process.exit(1);
+          });
+      case 'mesh-hook':
+        // Async, so the sync catch below cannot see its failures: swallow them here.
+        return require('../src/meshhooks')
+          .run()
+          .then((out) => process.stdout.write(out))
+          .catch(() => process.exit(0));
       case 'hooks': {
         if (opts._[0] !== 'claude-code') {
           console.error('Usage: coordboard hooks claude-code');

@@ -4,6 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const core = require('./core');
 const peers = require('./peers');
+const mesh = require('./mesh');
 
 function requireRoot(opts) {
   const root = core.findRoot(opts.cwd || process.cwd());
@@ -841,4 +842,83 @@ function sessionEnd() {
   return '';
 }
 
-module.exports = { init, register, check, event, wrap, sweep, who, guard, sessionStart, sessionEnd };
+async function meshView() {
+  const res = await mesh.local('/local/view');
+  if (!res) throw new Error('No mesh daemon on this machine. Start it with `coordboard mesh up`.');
+  return res;
+}
+
+function meshStatus(res) {
+  const v = res.view;
+  const lines = [`This node: ${res.self.id} (${res.self.user}), ${res.self.role}${res.hubAddr ? `, following ${res.hubAddr}` : ''}, priority ${res.self.priority}`];
+  if (!v) return lines.concat('No view from a hub yet.').join('\n');
+  lines.push(`Hub: ${v.hub}. Nodes: ${v.nodes.map((n) => `${n.id} (${n.user})`).join(', ') || 'none'}`);
+  const byRepo = new Map();
+  for (const s of v.sessions) byRepo.set(s.repoKey, (byRepo.get(s.repoKey) || []).concat(s));
+  for (const [repo, list] of byRepo) {
+    lines.push(`${repo}:`);
+    for (const s of list) {
+      const i = v.intents.find((x) => x.session_id === s.sessionId);
+      lines.push(`  - ${s.name || s.sessionId.slice(0, 8)} ${s.user}@${s.node}${i ? ` [${i.handle}] ${i.task}` : ''}`);
+    }
+  }
+  if (res.outbox) lines.push(`${res.outbox} write(s) queued for the hub.`);
+  return lines.join('\n');
+}
+
+function resolveTarget(view, to) {
+  const hits = view.sessions.filter((s) => {
+    if (s.name === to || s.sessionId === to || s.handle === to) return true;
+    if (to.length >= 6 && s.sessionId.startsWith(to)) return true;
+    return view.intents.some((i) => i.handle === to && i.session_id === s.sessionId);
+  });
+  if (hits.length === 1) return hits[0];
+  if (!hits.length) throw new Error(`No live session on the mesh answers to '${to}'. See 'coordboard mesh status'.`);
+  throw new Error(
+    `'${to}' is ambiguous: ${hits.map((s) => `${s.name} ${s.user}@${s.node} (${s.sessionId.slice(0, 8)})`).join('; ')}. Use a session id prefix.`
+  );
+}
+
+async function meshCommand(opts) {
+  const sub = opts._[0];
+  if (sub === 'daemon') {
+    const d = mesh.createDaemon();
+    try {
+      await d.start();
+    } catch (err) {
+      // EADDRINUSE: this machine already has a daemon, which is the normal case.
+      if (err && err.code === 'EADDRINUSE') return '';
+      throw err;
+    }
+    return new Promise(() => {});
+  }
+  if (sub === 'up') {
+    if (!(await mesh.ensureDaemon())) {
+      for (let i = 0; i < 20 && !(await mesh.local('/local/view')); i += 1) {
+        await new Promise((r) => setTimeout(r, 250));
+      }
+    }
+    return meshStatus(await meshView());
+  }
+  if (sub === 'status') return meshStatus(await meshView());
+  if (sub === 'down') {
+    await meshView();
+    await mesh.local('/local/stop', {});
+    return 'Mesh daemon stopping.';
+  }
+  if (sub === 'send') {
+    const to = typeof opts.to === 'string' ? opts.to : '';
+    const text = opts._.slice(1).join(' ').trim();
+    if (!to || !text) throw new Error('Usage: coordboard mesh send --to <session name|handle|session id> "<text>"');
+    const res = await meshView();
+    if (!res.view) throw new Error('The daemon has no view from a hub yet; try again in a few seconds.');
+    const target = resolveTarget(res.view, to);
+    const me = peers.self();
+    const from = `${res.self.user}@${res.self.id}${me ? ` (${me.name})` : ''}`;
+    await mesh.local('/local/msg', { to: target.sessionId, from, text });
+    return `Queued for ${target.name || target.sessionId} (${target.user}@${target.node}); it arrives on their next hook.`;
+  }
+  throw new Error('Usage: coordboard mesh up | status | down | send --to <name> "<text>"');
+}
+
+module.exports = { init, register, check, event, wrap, sweep, who, guard, sessionStart, sessionEnd, mesh: meshCommand };
