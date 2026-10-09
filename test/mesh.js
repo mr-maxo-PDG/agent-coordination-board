@@ -254,6 +254,21 @@ function post(port, route, body) {
     assert.ok(Date.now() - t0 < 1500, `took ${Date.now() - t0}ms`);
   });
 
+  await test('a follower rides out missed probes before taking the hub', async () => {
+    const H = daemon('node-h', BASE + 910, [], 0);
+    await H.start();
+    const F = daemon('node-f', BASE + 911, [BASE + 910], 0);
+    await F.start();
+    assert.strictEqual(F.state.role, 'follower');
+    await H.stop();
+    await F.tick();
+    await F.tick();
+    assert.strictEqual(F.state.role, 'follower');
+    await F.tick();
+    assert.strictEqual(F.state.role, 'hub');
+    await F.stop();
+  });
+
   for (const d of [A, B, D]) if (d) await d.stop();
   console.log(`\n${passed} mesh test(s) passed`);
   process.exit(process.exitCode || 0);

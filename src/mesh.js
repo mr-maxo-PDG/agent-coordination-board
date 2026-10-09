@@ -26,6 +26,7 @@ const DEFAULT_PORT = 7717;
 const BEAT_MS = 5000;
 // A node missing three beats is gone. Long enough to ride out one slow probe round.
 const EXPIRE_MS = 3 * BEAT_MS + 2000;
+const HUB_MISSES = 3;
 const PROBE_TIMEOUT_MS = 800;
 const BODY_LIMIT = 512 * 1024;
 const TOUCH_TTL_MS = 60 * 60 * 1000;
@@ -318,6 +319,8 @@ function createDaemon(cfgOverride) {
   const st = {
     role: 'follower',
     hub: null,
+    lastHub: null,
+    misses: 0,
     // hub tables
     nodes: new Map(),
     events: new Map(),
@@ -536,6 +539,8 @@ function createDaemon(cfgOverride) {
   function promote() {
     st.role = 'hub';
     st.hub = null;
+    st.lastHub = null;
+    st.misses = 0;
     me.hubSince = Date.now();
     log(`promoted to hub (priority ${me.priority})`);
   }
@@ -546,6 +551,8 @@ function createDaemon(cfgOverride) {
     for (const [to, list] of st.inbox) for (const m of list) handover.push({ to, at: m.at, from: m.from, text: m.text });
     st.role = 'follower';
     st.hub = addr;
+    st.lastHub = addr;
+    st.misses = 0;
     me.hubSince = 0;
     st.nodes.clear();
     st.events.clear();
@@ -561,7 +568,10 @@ function createDaemon(cfgOverride) {
     if (st.role === 'hub') {
       if (best && outranks(best.h, hello())) await demote(best.addr);
     } else if (!best) {
-      promote();
+      // One slow tailnet round trip past the probe timeout would otherwise split the
+      // mesh into two hubs; a follower stays loyal for HUB_MISSES beats (< EXPIRE_MS).
+      if (st.lastHub && ++st.misses < HUB_MISSES) st.hub = st.lastHub;
+      else promote();
     } else if (me.priority > best.h.priority) {
       // A preferred machine takes over: become hub, and the old one demotes on its
       // next tick when it sees this one outrank it.
@@ -569,6 +579,8 @@ function createDaemon(cfgOverride) {
     } else {
       if (st.hub !== best.addr) log(`following hub ${best.h.id} at ${best.addr}`);
       st.hub = best.addr;
+      st.lastHub = best.addr;
+      st.misses = 0;
     }
 
     const local = collectLocal();
