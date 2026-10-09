@@ -918,7 +918,37 @@ async function meshCommand(opts) {
     await mesh.local('/local/msg', { to: target.sessionId, from, text });
     return `Queued for ${target.name || target.sessionId} (${target.user}@${target.node}); it arrives on their next hook.`;
   }
-  throw new Error('Usage: coordboard mesh up | status | down | send --to <name> "<text>"');
+  if (sub === 'review') return meshReview((await meshView()).view, opts._[1]);
+  throw new Error('Usage: coordboard mesh up | status | down | review [user|session] | send --to <name> "<text>"');
 }
 
-module.exports = { init, register, check, event, wrap, sweep, who, guard, sessionStart, sessionEnd, mesh: meshCommand };
+// Read-only look at another user's (or one session's) work: what they are on and what
+// they changed in the last hour. Crosses the isolation on purpose, because a person ran it.
+function meshReview(view, who) {
+  if (!view) throw new Error('The daemon has no view from a hub yet; try again in a few seconds.');
+  if (!who) {
+    const users = new Map();
+    for (const s of view.sessions) users.set(s.user, (users.get(s.user) || 0) + 1);
+    return ['Users on the mesh:', ...[...users].map(([u, n]) => `  - ${u}: ${n} live session(s)`), 'Look closer with: coordboard mesh review <user|session>'].join('\n');
+  }
+  const bySession = view.sessions.filter((s) => s.name === who || s.handle === who || (who.length >= 6 && s.sessionId.startsWith(who)));
+  const sessions = bySession.length ? bySession : view.sessions.filter((s) => s.user === who);
+  if (!sessions.length) throw new Error(`No live user or session on the mesh matches '${who}'.`);
+  const ids = new Set(sessions.map((s) => s.sessionId));
+  const lines = [];
+  for (const s of sessions) {
+    const i = view.intents.find((x) => x.session_id === s.sessionId);
+    lines.push(`${s.name || s.sessionId.slice(0, 8)} ${s.user}@${s.node} in ${s.repoKey}`);
+    if (i) lines.push(`  task: ${i.task}`, `  claims: ${i.claims.join(', ') || 'none'}`);
+  }
+  const edits = view.touches.filter((t) => ids.has(t.sessionId)).slice(-15);
+  lines.push(edits.length ? 'Edits in the last hour, newest last:' : 'No edits in the last hour.');
+  for (const t of edits) {
+    lines.push(`- ${new Date(t.at).toISOString().slice(11, 16)}Z ${t.name || t.sessionId.slice(0, 8)} ${t.tool} ${t.path}`);
+    lines.push(...String(t.patch).split('\n').map((l) => `    ${l}`));
+  }
+  lines.push('Give feedback with: coordboard mesh send --to <session name> "<text>"');
+  return lines.join('\n');
+}
+
+module.exports = { init, register, check, event, wrap, sweep, who, guard, sessionStart, sessionEnd, mesh: meshCommand, meshReview };

@@ -80,7 +80,16 @@ function loadMeshConfig() {
     bind,
     token: typeof raw.token === 'string' ? raw.token : '',
     user: core.sanitize(process.env.COORD_USER || (typeof raw.user === 'string' ? raw.user : '') || osUser(), 64),
+    collaborate: Array.isArray(raw.collaborate)
+      ? raw.collaborate.filter((u) => typeof u === 'string').map((u) => core.sanitize(u, 64))
+      : [],
   };
+}
+
+// Automatic flow (pushed edits, claim warnings, the startup roster) stays inside one
+// user unless `collaborate` names another. Explicit acts, review and send, cross freely.
+function sharesWork(cfg, user) {
+  return user === cfg.user || cfg.collaborate.includes(user);
 }
 
 // Tailscale hands out addresses from the CGNAT block 100.64.0.0/10. Reading interfaces
@@ -571,9 +580,13 @@ function createDaemon(cfgOverride) {
     const p = cleanPath(q.path);
     const last = (st.reads.get(sid) || new Map()).get(`${repoKey}|${p}`) || 0;
     const view = st.view || { touches: [], intents: [] };
-    const touches = view.touches.filter((t) => t.repoKey === repoKey && t.path === p && t.sessionId !== sid && t.at > last);
+    const touches = view.touches.filter(
+      (t) => t.repoKey === repoKey && t.path === p && t.sessionId !== sid && t.at > last && sharesWork(cfg, t.user)
+    );
     const claims = view.intents.filter(
-      (i) => i.repoKey === repoKey && i.node !== me.id && i.session_id !== sid && i.claims.some((c) => core.claimMatches(p, c))
+      (i) =>
+        i.repoKey === repoKey && i.node !== me.id && i.session_id !== sid && sharesWork(cfg, i.user) &&
+        i.claims.some((c) => core.claimMatches(p, c))
     );
     return { touches, claims };
   }
@@ -600,7 +613,7 @@ function createDaemon(cfgOverride) {
     if (!sid || !engaged || !st.view) return { changes: [] };
     const since = st.notified.get(sid) || Date.now();
     const changes = st.view.touches
-      .filter((t) => t.sessionId !== sid && t.at > since && !(st.sent.get(sid) || new Set()).has(t.patch))
+      .filter((t) => t.sessionId !== sid && t.at > since && sharesWork(cfg, t.user) && !(st.sent.get(sid) || new Set()).has(t.patch))
       .filter((t) => {
         const readAt = engaged.get(`${t.repoKey}|${t.path}`);
         if (readAt === undefined) return false;
@@ -764,6 +777,7 @@ module.exports = {
   BEAT_MS,
   meshHome,
   loadMeshConfig,
+  sharesWork,
   tailnetAddresses,
   normalizeRemote,
   repoInfo,

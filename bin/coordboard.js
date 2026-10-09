@@ -56,6 +56,11 @@ const USAGE = `coordboard - coordination board for parallel AI coding agents
   coordboard mesh send --to <session name|handle|session id> "<text>"
       Message a session on any machine; it arrives on that session's next hook.
 
+  coordboard mesh review [user|session]
+      Read another user's or session's work: task, claims, and the last hour's
+      patches. Sessions get pushed edits, claim warnings and the startup roster
+      only from their own user, plus any user named in mesh.json "collaborate".
+
 Hook adapters (read hook JSON on stdin, not for humans):
   coordboard guard | coordboard session-start | coordboard session-end | coordboard mesh-hook
 `;

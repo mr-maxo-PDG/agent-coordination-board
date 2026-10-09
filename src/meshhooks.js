@@ -82,10 +82,16 @@ async function onSessionStart(input) {
   if (!info || !snap) return [];
   const myNode = snap.self.id;
   const view = snap.view;
-  const remote = view.sessions.filter((s) => s.repoKey === info.key && s.node !== myNode);
-  const intents = view.intents.filter((i) => i.repoKey === info.key && i.node !== myNode);
-  const events = (view.events[info.key] || []).filter((e) => e.node !== myNode).slice(-6);
-  if (!remote.length && !intents.length && !events.length) return [];
+  const cfg = mesh.loadMeshConfig();
+  const inRepo = view.sessions.filter((s) => s.repoKey === info.key && s.node !== myNode);
+  const remote = inRepo.filter((s) => mesh.sharesWork(cfg, s.user));
+  const otherUsers = [...new Set(inRepo.filter((s) => !mesh.sharesWork(cfg, s.user)).map((s) => s.user))];
+  const intents = view.intents.filter((i) => i.repoKey === info.key && i.node !== myNode && mesh.sharesWork(cfg, i.user));
+  const events = (view.events[info.key] || []).filter((e) => e.node !== myNode && mesh.sharesWork(cfg, e.user)).slice(-6);
+  if (!remote.length && !intents.length && !events.length && !otherUsers.length) return [];
+  if (!remote.length && !intents.length && !events.length) {
+    return [`Mesh: ${otherUsers.join(', ')} also work in this repo, isolated from you. Do not act on their work unless your user asks; your user can look with coordboard mesh review <user>.`];
+  }
   const lines = [`Mesh (hub ${view.hub}${hello ? '' : ', local daemon starting'}): sessions in this repo on other machines.`];
   for (const s of remote) {
     const i = intents.find((x) => x.session_id === s.sessionId);
@@ -99,6 +105,7 @@ async function onSessionStart(input) {
     for (const e of events) lines.push(`- ${e.user}@${e.node}: ${e.text}`);
   }
   lines.push('Message any of them with: coordboard mesh send --to <session name> "<text>"');
+  if (otherUsers.length) lines.push(`Also in this repo, isolated from you: ${otherUsers.join(', ')}.`);
   return lines;
 }
 

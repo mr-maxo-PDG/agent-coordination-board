@@ -32,7 +32,9 @@ const addr = (p) => `127.0.0.1:${p}`;
 
 function daemon(id, port, nodes, priority) {
   process.env.COORD_MACHINE = id;
-  return mesh.createDaemon({ port, nodes: nodes.map(addr), priority: priority || 0, bind: ['127.0.0.1'], token: '' });
+  return mesh.createDaemon({
+    port, nodes: nodes.map(addr), priority: priority || 0, bind: ['127.0.0.1'], token: '', user: 'max', collaborate: ['nate'],
+  });
 }
 
 function post(port, route, body) {
@@ -180,6 +182,33 @@ function post(port, route, body) {
     await post(pB, '/local/read', { sessionId: 'sess-b-0005', repoKey: repo, path: 'src/emit.ts' });
     const r = await post(pB, '/local/peer-changes', { sessionId: 'sess-b-0005', tree: 'tree-b' });
     assert.strictEqual(r.body.changes.length, 0);
+  });
+
+  await test('another user is isolated: no pushes or warnings unless collaborate names them', async () => {
+    const repo = 'github.com/x/y';
+    const saved = B.cfg.collaborate;
+    B.cfg.collaborate = [];
+    try {
+      await post(pB, '/local/read', { sessionId: 'sess-b-0007', repoKey: repo, path: 'src/iso.ts' });
+      await new Promise((r) => setTimeout(r, 5));
+      await post(pA, '/touch', { repoKey: repo, path: 'src/iso.ts', sessionId: 'sess-c-0001', node: 'node-c', user: 'nate', tool: 'Edit', tree: 'tree-c', patch: '- i\n+ j' });
+      await B.tick();
+      const pushed = await post(pB, '/local/peer-changes', { sessionId: 'sess-b-0007', tree: 'tree-b' });
+      assert.strictEqual(pushed.body.changes.length, 0);
+      const warned = await post(pB, '/local/since', { sessionId: 'sess-b-0007', repoKey: repo, path: 'src/iso.ts' });
+      assert.strictEqual(warned.body.touches.length, 0);
+    } finally {
+      B.cfg.collaborate = saved;
+    }
+  });
+
+  await test('review shows another user their sessions, task and recent patches', async () => {
+    const commands = require('../src/commands');
+    const out = commands.meshReview(B.state.view, 'nate');
+    assert.ok(out.includes('nate-session') || out.includes('sess-c-0'), out);
+    assert.ok(out.includes('src/parser.ts'), out);
+    assert.ok(out.includes('+ new'), out);
+    assert.ok(commands.meshReview(B.state.view).includes('nate'));
   });
 
   await test('local endpoints are not served to hub routes, and hub routes refuse a follower', async () => {
